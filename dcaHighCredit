@@ -1,0 +1,190 @@
+WITH merchant_mcc AS (
+    SELECT DISTINCT
+        a.mcc,
+        e.user_id,
+        d.account_id,
+        d.customer_id
+    FROM merchantdb_gold.merchant_info a
+    LEFT JOIN merchantdb_gold.merchant_orchestrator b
+        ON CAST(a.id AS VARCHAR) = CAST(b.merchant_info_id AS VARCHAR)
+    LEFT JOIN merchantdb_gold_pii.settlement_bank_account c
+        ON CAST(b.virtual_account_number AS VARCHAR) = CAST(c.virtual_account_number AS VARCHAR)
+    LEFT JOIN bsgcore_gold.customer_accounts d
+        ON decryptFunction(c.account_number) = d.account_no
+    LEFT JOIN druid_gold.user_savings_details e
+        ON e.account_number = d.account_no AND e.__is_deleted = FALSE
+),
+
+state AS (
+    SELECT * FROM (
+        SELECT
+            a.customer_id,
+            b.data_description AS kyc_state,
+            a.pin_code AS kyc_pincode,
+            ROW_NUMBER() OVER (PARTITION BY a.customer_id ORDER BY address_type_code) AS rn
+        FROM bsgcrm_gold.customer_address a
+        JOIN merchant_mcc mc ON mc.customer_id = a.customer_id
+        JOIN bsgmaster_gold.picklist_type_data b
+            ON b.type_code = 4 AND b.__is_deleted = false AND b.is_active = true
+           AND a.state_code = b.data_code
+        WHERE a.__is_deleted = false AND a.is_active = 1
+    ) WHERE rn = 1
+),
+
+base AS (
+    SELECT
+        b.account_id,
+        m.user_id,
+        m.customer_id,
+        m.mcc,
+        s.kyc_state,
+        CASE
+            WHEN m.mcc IN ('5411','5412','5441','5451','5499') THEN 'GROCERY'
+            WHEN m.mcc IN ('5311','5331','5651','5699','5999') THEN 'RETAIL'
+        END AS mcc_type,
+        CAST(coalesce(b.account_open_date, b.created_date) AS DATE) AS onboarded_date
+    FROM bsgcore_gold_pii.account_master b
+    JOIN merchant_mcc m ON b.account_id = m.account_id
+    JOIN state s ON s.customer_id = m.customer_id
+    WHERE b.is_active = 1
+      AND b.__is_deleted = false
+      AND b.product_code = 1150
+      AND CAST(coalesce(b.account_open_date, b.created_date) AS DATE) BETWEEN DATE '2026-05-01' AND DATE '2026-06-09'
+      AND s.kyc_state IN (
+            'Rajasthan',
+            'West Bengal',
+            'Uttar Pradesh',
+            'Jharkhand',
+            'Madhya Pradesh',
+            'Haryana'
+      )
+      AND m.mcc NOT IN ('5541','5542','5172','5812','5813','5814','4900','4911','4941','4813','5912','5122')
+      AND m.mcc IN (
+            '5411','5412','5441','5451','5499',
+            '5311','5331','5651','5699','5999'
+      )
+),
+
+user_labels AS (
+    SELECT
+        b.user_id,
+        b.account_id,
+        b.mcc_type,
+        b.kyc_state,
+        date_trunc('month', b.onboarded_date) AS onboarded_month,
+        CASE
+            WHEN z.layer = 1 THEN 'L1_FRAUD'
+            ELSE 'NON_L1'
+        END AS user_segment
+    FROM base b
+    LEFT JOIN (
+        SELECT uuid,
+               MIN(CASE WHEN layer = 0 THEN 1 ELSE layer END) AS layer
+        FROM s3_tool_propagator_pii.mha_case_registry
+        WHERE txn_nature_internal = 'C'
+        GROUP BY 1
+    ) z ON z.uuid = b.user_id
+),
+
+txn_rows AS (
+    SELECT
+        a.account_id,
+        b.user_id,
+        a.txn_ref_no,
+        a.txn_amount,
+        a.created_date + INTERVAL '330' MINUTE AS created_date,
+        CASE
+            WHEN hour(a.created_date + INTERVAL '330' MINUTE) BETWEEN 22 AND 23
+              OR hour(a.created_date + INTERVAL '330' MINUTE) BETWEEN 0 AND 8
+            THEN 'off_hrs'
+            ELSE 'on_hrs'
+        END AS hrs_tag
+    FROM bsgaccounting_gold.transaction_master a
+    JOIN base b
+      ON a.account_id = b.account_id
+     AND a.created_date <= b.onboarded_date + INTERVAL '15' DAY
+    WHERE a.is_active = true AND a.__is_deleted = false
+      AND a.txn_nature = 'C'
+      AND CAST(a.created_date AS DATE) BETWEEN DATE '2026-05-01' AND DATE '2026-06-09'
+      AND a.year >= 2026
+      
+
+    UNION ALL
+
+    SELECT
+        a.account_id,
+        b.user_id,
+        a.txn_ref_no,
+        a.txn_amount,
+        a.created_date + INTERVAL '330' MINUTE AS created_date,
+        CASE
+            WHEN hour(a.created_date + INTERVAL '330' MINUTE) BETWEEN 22 AND 23
+              OR hour(a.created_date + INTERVAL '330' MINUTE) BETWEEN 0 AND 8
+            THEN 'off_hrs'
+            ELSE 'on_hrs'
+        END AS hrs_tag
+    FROM bsgdeepfreeze_gold.transaction_master_df a
+    JOIN base b
+      ON a.account_id = b.account_id
+     AND a.created_date <= b.onboarded_date + INTERVAL '15' DAY
+    WHERE a.is_active = true AND a.__is_deleted = false
+      AND a.txn_nature = 'C'
+      AND CAST(a.created_date AS DATE) BETWEEN DATE '2026-05-01' AND DATE '2026-06-09'
+      AND a.year >= 2026
+      
+)
+
+
+,
+
+rolling_15m AS (
+    SELECT
+        t1.account_id,
+        t1.user_id,
+        t1.txn_ref_no AS anchor_txn_id,
+        t1.created_date AS window_end,
+        t1.txn_amount AS anchor_txn_amount,
+        t1.hrs_tag AS anchor_hrs_tag,
+        COUNT(t2.txn_ref_no) AS window_txn_count,
+        SUM(t2.txn_amount) AS window_credit_sum
+    FROM txn_rows t1
+    JOIN txn_rows t2
+      ON t1.account_id = t2.account_id
+     AND t2.created_date >= t1.created_date - INTERVAL '15' MINUTE
+     AND t2.created_date <= t1.created_date
+    GROUP BY
+        t1.account_id,
+        t1.user_id,
+        t1.txn_ref_no,
+        t1.created_date,
+        t1.txn_amount,
+        t1.hrs_tag
+),
+
+shortlisted_windows AS (
+    SELECT *
+    FROM rolling_15m
+    WHERE window_txn_count >= 10
+      AND window_credit_sum >= 30000
+),
+
+thresholds AS (
+    SELECT user_id, MAX(window_credit_sum) AS threshold_credit_sum
+    FROM shortlisted_windows
+    GROUP BY 1
+)
+
+SELECT
+    sw.account_id,
+    sw.user_id,
+    sw.anchor_txn_id,
+    sw.window_end,
+    sw.anchor_txn_amount,
+    sw.anchor_hrs_tag,
+    sw.window_txn_count,
+    sw.window_credit_sum
+FROM shortlisted_windows sw
+JOIN thresholds t
+  ON sw.user_id = t.user_id
+ AND sw.window_credit_sum = t.threshold_credit_sum
+WHERE DATE(sw.window_end) BETWEEN DATE '2026-05-01' AND DATE '2026-06-09'
