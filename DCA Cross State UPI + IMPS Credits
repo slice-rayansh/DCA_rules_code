@@ -1,0 +1,275 @@
+WITH merchant_mcc AS (
+    SELECT DISTINCT
+        a.mcc, e.user_id, d.account_id, d.customer_id, d.account_no
+    FROM merchantdb_gold.merchant_info a
+    JOIN merchantdb_gold.merchant_orchestrator b ON a.id = b.merchant_info_id
+    JOIN merchantdb_gold_pii.settlement_bank_account c ON b.virtual_account_number = c.virtual_account_number
+    JOIN bsgcore_gold.customer_accounts d ON decryptFunction(c.account_number) = d.account_no
+    JOIN druid_gold.user_savings_details e ON e.account_number = d.account_no AND e.__is_deleted = FALSE
+),
+base_base AS (
+    SELECT
+        b.account_id, m.user_id, m.customer_id, m.account_no, m.mcc,
+        ks.kyc_state,
+        b.branch_code,
+        DATE(COALESCE(b.account_open_date, b.created_date)) AS onboarded_date,
+        ROW_NUMBER() OVER (
+                PARTITION BY m.user_id
+                ORDER BY COALESCE(b.account_open_date, b.created_date) ASC, b.account_id ASC
+            ) AS rn
+    FROM bsgcore_gold.account_master b
+    JOIN merchant_mcc m ON b.account_id = m.account_id
+    JOIN (
+        SELECT ca.customer_id, ptd.data_description AS kyc_state
+        FROM (
+            SELECT customer_id, state_code,
+                   ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY address_type_code) AS rn
+            FROM bsgcrm_gold.customer_address
+            WHERE __is_deleted = false AND is_active = 1
+        ) ca
+        JOIN bsgmaster_gold.picklist_type_data ptd
+            ON ptd.type_code = 4 AND ptd.__is_deleted = false AND ptd.is_active = true
+           AND ca.state_code = ptd.data_code
+        WHERE ca.rn = 1
+    ) ks ON ks.customer_id = m.customer_id
+    WHERE b.is_active = 1 AND b.__is_deleted = false AND b.product_code = 1150
+      AND m.mcc IN ('5999','5699','5968','5411','7322','7011','7929')
+),
+base AS (
+    SELECT * FROM base_base WHERE rn = 1
+),
+user_labels AS (
+    SELECT
+        b.user_id, b.account_id, b.account_no, b.customer_id, b.mcc, b.kyc_state,
+        b.onboarded_date, b.branch_code,
+        CASE WHEN z.layer = 1 THEN 'L1_FRAUD' ELSE 'NON_L1' END AS user_segment,
+        SUM(CASE WHEN ua.udyam_ref IS NOT NULL THEN 1 ELSE 0 END) AS udyam_autofetched_flag
+    FROM base b
+    LEFT JOIN (
+        SELECT cif, MIN(CASE WHEN layer = 0 THEN 1 ELSE layer END) AS layer
+        FROM s3_tool_propagator_pii.mha_case_registry
+        WHERE txn_nature_internal = 'C'
+        GROUP BY 1
+    ) z ON z.cif = CAST(b.customer_id AS varchar)
+    LEFT JOIN onboarding_v2_gold.udyam_autofetch ua ON ua.user_uuid = b.user_id
+    -- WHERE user_id IN ('9056e1be-2af9-4970-8c15-5bb7801d3007','164598ca-f40a-4df3-acda-8aa3b726453d')
+    GROUP BY 1,2,3,4,5,6,7,8,9
+)
+-- select * from user_labels
+,
+ifsc_lookup AS (
+    SELECT DISTINCT ifsc, UPPER(TRIM(state)) AS state
+    FROM s3_tool_propagator.ifsc_state_mapping
+    WHERE state IS NOT NULL AND TRIM(state) <> ''
+),
+-- UPI + IMPS credits in first 10 days
+credits_10d AS (
+    -- UPI credits
+    SELECT
+        ul.user_id,
+        ul.user_segment,
+        ul.kyc_state,
+        ul.mcc,
+        'UPI' AS txn_rail,
+        CAST(t.amount AS DOUBLE) AS amount,
+        t.counter_party_ifsc,
+        ifsc.state AS counterparty_state,
+        CASE
+            WHEN ifsc.state IS NOT NULL
+             AND ifsc.state <> UPPER(TRIM(ul.kyc_state))
+            THEN 1 ELSE 0
+        END AS is_cross_state,
+        CASE WHEN CAST(t.amount AS DOUBLE) % 1000 = 0 THEN 1 ELSE 0 END AS is_round_1000,
+        CASE WHEN CAST(t.amount AS DOUBLE) % 100 = 0 THEN 1 ELSE 0 END  AS is_round_100,
+        -- Decimal flag: amount has paise (not a whole number)
+CASE WHEN CAST(t.amount AS DOUBLE) <> FLOOR(CAST(t.amount AS DOUBLE)) THEN 1 ELSE 0 END AS is_decimal,
+-- Near-round: within 1-2% below a round threshold
+-- Near 50k, 25k, 10k, 5k, 1k boundaries
+CASE WHEN CAST(t.amount AS DOUBLE) BETWEEN 49000 AND 49999 THEN 1
+     WHEN CAST(t.amount AS DOUBLE) BETWEEN 24000 AND 24999 THEN 1
+     WHEN CAST(t.amount AS DOUBLE) BETWEEN 9000 AND 9999   THEN 1
+     WHEN CAST(t.amount AS DOUBLE) BETWEEN 4500 AND 4999   THEN 1
+     WHEN CAST(t.amount AS DOUBLE) BETWEEN 900 AND 999     THEN 1
+     ELSE 0
+END AS is_near_round,
+-- Specifically ends in 999 or 99 (classic evasion pattern)
+CASE WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 1000 = 999 THEN 1
+     WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 100 = 99   THEN 1
+     ELSE 0
+END AS is_ends_99_999,
+CASE WHEN tt.narration = 'Payment to slice merchant QR' then 'scan'
+else 'non_scan' end as scan_and_pay
+    FROM upiswitch_tpap_gold.cbs_transactions t
+    LEFT JOIN casa_txn_gold.transaction tt on tt.src_txn_id = t.src_txn_id
+    JOIN user_labels ul ON t.user_account_number = ul.account_no
+    AND CAST(t.created_at AS DATE) <= ul.onboarded_date + INTERVAL '10' DAY
+    LEFT JOIN ifsc_lookup ifsc ON t.counter_party_ifsc = ifsc.ifsc
+    WHERE t.year >= 2025
+      AND t.txn_type = 'CREDIT'
+      AND t.txn_status = 'SUCCESS'
+      AND (t.__is_deleted IS NULL OR t.__is_deleted = false)
+      
+    UNION ALL
+    -- IMPS credits
+    SELECT
+        ul.user_id,
+        ul.user_segment,
+        ul.kyc_state,
+        ul.mcc,
+        'IMPS' AS txn_rail,
+        CAST(t.amount AS DOUBLE) AS amount,
+        t.counter_party_ifsc,
+        ifsc.state AS counterparty_state,
+        CASE
+            WHEN ifsc.state IS NOT NULL
+             AND ifsc.state <> UPPER(TRIM(ul.kyc_state))
+            THEN 1 ELSE 0
+        END AS is_cross_state,
+        CASE WHEN CAST(t.amount AS DOUBLE) % 1000 = 0 THEN 1 ELSE 0 END AS is_round_1000,
+        CASE WHEN CAST(t.amount AS DOUBLE) % 100 = 0 THEN 1 ELSE 0 END  AS is_round_100,
+        -- Decimal flag: amount has paise (not a whole number)
+CASE WHEN CAST(t.amount AS DOUBLE) <> FLOOR(CAST(t.amount AS DOUBLE)) THEN 1 ELSE 0 END AS is_decimal,
+-- Near-round: within 1-2% below a round threshold
+-- Near 50k, 25k, 10k, 5k, 1k boundaries
+CASE WHEN CAST(t.amount AS DOUBLE) BETWEEN 49000 AND 49999 THEN 1
+     WHEN CAST(t.amount AS DOUBLE) BETWEEN 24000 AND 24999 THEN 1
+     WHEN CAST(t.amount AS DOUBLE) BETWEEN 9000 AND 9999   THEN 1
+     WHEN CAST(t.amount AS DOUBLE) BETWEEN 4500 AND 4999   THEN 1
+     WHEN CAST(t.amount AS DOUBLE) BETWEEN 900 AND 999     THEN 1
+     ELSE 0
+END AS is_near_round,
+-- Specifically ends in 999 or 99 (classic evasion pattern)
+CASE WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 1000 = 999 THEN 1
+     WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 100 = 99   THEN 1
+     ELSE 0
+END AS is_ends_99_999,
+CASE WHEN tt.narration = 'Payment to slice merchant QR' then 'scan'
+else 'non_scan' end as scan_and_pay
+    FROM imps_switch_gold.imps_transactions t
+     LEFT JOIN casa_txn_gold.transaction tt on tt.src_txn_id = t.cbs_ref_id
+    JOIN imps_switch_gold.imps_transaction_statuses ts
+        ON t.id = ts.txn_id AND ts.txn_status = 'SUCCESS'
+    JOIN user_labels ul ON t.user_account_number = ul.account_no
+    AND CAST(t.created_at AS DATE) <= ul.onboarded_date + INTERVAL '10' DAY
+    LEFT JOIN ifsc_lookup ifsc ON t.counter_party_ifsc = ifsc.ifsc
+    WHERE t.year >= 2025
+      AND t.txn_type = 'CREDIT'
+      AND (t.__is_deleted IS NULL OR t.__is_deleted = false)
+      
+)
+,
+per_user AS (
+    SELECT
+        user_id,
+        user_segment,
+        kyc_state,
+        mcc,
+        COUNT(*)                                                              AS total_credits,
+        SUM(amount)                                                           AS total_credit_amt,
+        -- By rail
+        SUM(CASE WHEN txn_rail = 'UPI' THEN 1 ELSE 0 END)                    AS upi_credit_count,
+        SUM(CASE WHEN txn_rail = 'IMPS' THEN 1 ELSE 0 END)                   AS imps_credit_count,
+        -- Cross state
+        SUM(is_cross_state)                                                   AS cross_state_count,
+        SUM(CASE WHEN is_cross_state = 1 THEN amount ELSE 0 END)             AS cross_state_amt,
+        SUM(CASE WHEN is_cross_state = 0 THEN 1 ELSE 0 END)                  AS same_state_count,
+        SUM(CASE WHEN is_cross_state = 0 THEN amount ELSE 0 END)             AS same_state_amt,
+        CAST(SUM(is_cross_state) * 1.0 / COUNT(*) AS DOUBLE)                 AS pct_cross_state,
+        COUNT(DISTINCT CASE WHEN is_cross_state = 1 THEN counterparty_state END) AS distinct_cross_states,
+        -- Round figures
+        SUM(is_round_1000)                                                    AS round_1000_count,
+        SUM(CASE WHEN is_round_1000 = 1 THEN amount ELSE 0 END)              AS round_1000_amt,
+        SUM(is_round_100)                                                     AS round_100_count,
+        SUM(CASE WHEN is_round_100 = 1 THEN amount ELSE 0 END)               AS round_100_amt,
+        CAST(SUM(is_round_1000) * 1.0 / COUNT(*) AS DOUBLE)                  AS pct_round_1000,
+        CAST(SUM(is_round_100) * 1.0 / COUNT(*) AS DOUBLE)                   AS pct_round_100,
+        -- Cross state + round overlap
+        SUM(CASE WHEN is_cross_state = 1 AND is_round_1000 = 1 THEN 1 ELSE 0 END) AS cross_state_round_1000_count,
+        SUM(CASE WHEN is_cross_state = 1 AND is_round_100 = 1 THEN 1 ELSE 0 END)  AS cross_state_round_100_count,
+        -- Distinct amounts
+        COUNT(DISTINCT amount)                                                AS distinct_amounts,
+        CAST(COUNT(DISTINCT amount) * 1.0 / COUNT(*) AS DOUBLE)              AS distinct_amount_ratio,
+        -- Avg txn size
+        AVG(amount)                                                           AS avg_credit_amt,
+        AVG(CASE WHEN is_cross_state = 1 THEN amount END)                    AS avg_cross_state_amt,
+        AVG(CASE WHEN is_cross_state = 0 THEN amount END)                    AS avg_same_state_amt,
+        -- Decimal
+SUM(is_decimal)                                                               AS decimal_count,
+SUM(CASE WHEN is_cross_state = 1 AND is_decimal = 1 THEN 1 ELSE 0 END)       AS cross_state_decimal_count,
+-- Near round
+SUM(is_near_round)                                                            AS near_round_count,
+SUM(CASE WHEN is_cross_state = 1 AND is_near_round = 1 THEN 1 ELSE 0 END)    AS cross_state_near_round_count,
+-- Ends 99/999
+SUM(is_ends_99_999)                                                           AS ends_99_999_count,
+SUM(CASE WHEN is_cross_state = 1 AND is_ends_99_999 = 1 THEN 1 ELSE 0 END)   AS cross_state_ends_99_999_count,
+-- Scan and pay
+SUM(CASE WHEN scan_and_pay = 'scan' THEN 1 ELSE 0 END)                       AS scan_pay_count,
+SUM(CASE WHEN scan_and_pay = 'scan' AND is_cross_state = 1 THEN 1 ELSE 0 END) AS cross_state_scan_pay_count
+--CASE WHEN CAST(credits_10d.amount AS DOUBLE) BETWEEN 1 AND 101 THEN 1 ELSE 0 END AS is_micro_txn
+    FROM credits_10d
+    GROUP BY 1, 2, 3, 4
+)
+-- select * from per_user
+SELECT
+    pu.user_id,
+    pu.user_segment,
+    pu.kyc_state,
+    pu.mcc,
+    ul.onboarded_date,
+    ul.branch_code,
+    ul.udyam_autofetched_flag,
+    CASE WHEN bd.gst_ref_id IS NULL THEN 'no_gst' ELSE 'gst_present' END AS gst_flag,
+    bd.estimated_annual_turnover,
+    CASE WHEN sb.user_id IS NULL THEN 'no_sb' ELSE 'sb_present' END AS sb_flag,
+    CASE WHEN bu.uuid IS NOT NULL THEN 'blacklisted_or_frozen' ELSE 'clean' END AS blacklist_flag,
+    pu.total_credits,
+    pu.total_credit_amt,
+    pu.upi_credit_count,
+    pu.imps_credit_count,
+    pu.cross_state_count,
+    pu.cross_state_amt,
+    pu.same_state_count,
+    pu.same_state_amt,
+    ROUND(pu.pct_cross_state, 4)             AS pct_cross_state,
+    pu.distinct_cross_states,
+    pu.round_1000_count,
+    pu.round_1000_amt,
+    pu.round_100_count,
+    pu.round_100_amt,
+    ROUND(pu.pct_round_1000, 4)              AS pct_round_1000,
+    ROUND(pu.pct_round_100, 4)               AS pct_round_100,
+    pu.cross_state_round_1000_count,
+    pu.cross_state_round_100_count,
+    pu.distinct_amounts,
+    ROUND(pu.distinct_amount_ratio, 4)       AS distinct_amount_ratio,
+    ROUND(pu.avg_credit_amt, 2)              AS avg_credit_amt,
+    ROUND(pu.avg_cross_state_amt, 2)         AS avg_cross_state_amt,
+    ROUND(pu.avg_same_state_amt, 2)          AS avg_same_state_amt
+    --SUM(is_micro_txn)                                                             AS micro_txn_count
+FROM per_user pu
+JOIN user_labels ul ON ul.user_id = pu.user_id
+LEFT JOIN (
+    SELECT uuid, estimated_annual_turnover, gst_ref_id,
+           ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY created_at DESC) AS rk
+    FROM kycdb_gold.business_details
+    WHERE __is_deleted = FALSE OR __is_deleted IS NULL
+) bd ON bd.uuid = pu.user_id AND bd.rk = 1
+LEFT JOIN merchantdb_gold.user_soundbox sb ON sb.user_id = pu.user_id
+LEFT JOIN (
+    SELECT decryptFunction(value) AS uuid FROM slice_fcu_db_gold_pii.blacklist_entry
+    WHERE blacklisttypeid = 672 AND __is_deleted = FALSE
+    UNION
+    SELECT user_id FROM druid_gold.user_savings_details
+    WHERE txn_status <> 'NO_FREEZE' AND __is_deleted = FALSE
+) bu ON bu.uuid = pu.user_id
+WHERE 
+pu.total_credits < 10
+-- AND pu.user_segment = 'L1_FRAUD'
+  AND pu.cross_state_count >= 1
+  AND pu.distinct_cross_states>3
+  AND pu.cross_state_count>=8
+  AND pu.cross_state_amt>5000
+  AND YEAR(ul.onboarded_date)=2026
+  AND MONTH(ul.onboarded_date)>=5
+  --AND DAY(ul.onboarded_date)
+ORDER BY pu.user_segment, pu.cross_state_count DESC
