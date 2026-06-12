@@ -1,0 +1,326 @@
+WITH
+
+-- Step 1: Filter MCCs first (smallest table, no joins yet)
+filtered_merchants AS (
+    SELECT id, mcc
+    FROM merchantdb_gold.merchant_info
+    WHERE mcc IN (
+
+    '763',	'5411','5699',	'5999')
+    -- WHERE mcc IN (
+    --     '5411','5412','5441','5451','5499',   -- GROCERY
+    --     '5311','5331','5651','5699','5999'  , '763'  -- RETAIL
+    -- )
+    -- NOT IN is redundant here since the IN above already excludes those MCCs
+    -- but keep if overlap is possible
+),
+
+-- Step 2: Walk the merchant chain only for filtered MCCs
+merchant_with_vaccount AS (
+    SELECT
+        fm.mcc,
+        b.virtual_account_number
+    FROM filtered_merchants fm
+    JOIN merchantdb_gold.merchant_orchestrator b
+        ON fm.id = b.merchant_info_id
+),
+
+-- Step 3: Resolve account_no from virtual account (small bridge table)
+merchant_accounts AS (
+    SELECT
+        mw.mcc,
+        decryptFunction(c.account_number) AS account_no
+    FROM merchant_with_vaccount mw
+    JOIN merchantdb_gold_pii.settlement_bank_account c
+        ON mw.virtual_account_number = c.virtual_account_number
+),
+
+-- Step 4: Map account_no → account_id, customer_id
+merchant_core AS (
+    SELECT DISTINCT
+        ma.mcc,
+        d.account_id,
+        d.customer_id,
+        ma.account_no
+    FROM merchant_accounts ma
+    JOIN bsgcore_gold.customer_accounts d
+        ON ma.account_no = d.account_no
+),
+
+-- Step 5: Add user_id only for active savings accounts
+merchant_mcc_filtered AS (
+    SELECT
+        mc.mcc,
+        mc.account_id,
+        mc.customer_id,
+        mc.account_no,
+        e.user_id
+    FROM merchant_core mc
+    JOIN druid_gold.user_savings_details e
+        ON e.account_number = mc.account_no
+       AND e.__is_deleted = FALSE
+),
+
+-- Step 6: KYC state filter — only target states
+kyc_states AS (
+    SELECT
+        ca.customer_id,
+        ptd.data_description AS kyc_state
+    FROM (
+        SELECT
+            customer_id,
+            state_code,
+            ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY address_type_code) AS rn
+        FROM bsgcrm_gold.customer_address
+        WHERE __is_deleted = false AND is_active = 1
+    ) ca
+    JOIN bsgmaster_gold.picklist_type_data ptd
+        ON ptd.type_code = 4
+       AND ptd.__is_deleted = false
+       AND ptd.is_active = true
+       AND ca.state_code = ptd.data_code
+    WHERE ca.rn = 1
+      AND lower(ptd.data_description) IN (
+          'rajasthan', 'west bengal', 'uttar pradesh',
+          'jharkhand', 'madhya pradesh', 'haryana'
+      )
+),
+
+-- Step 7: Active accounts in target onboarding months only
+active_accounts AS (
+    SELECT account_id, customer_id, created_date
+    FROM bsgcore_gold_pii.account_master
+    WHERE is_active = 1
+      AND __is_deleted = false
+      AND product_code = 1150
+AND CAST(created_date AS DATE)
+    BETWEEN DATE '2026-05-01' AND DATE '2026-06-12'
+),
+
+base AS (
+    SELECT
+        aa.account_id,
+        m.user_id,
+        m.customer_id,
+        m.account_no,
+        m.mcc,
+        ks.kyc_state,
+        CASE
+            WHEN m.mcc IN ('5411','5412','5441','5451','5499') THEN 'GROCERY'
+            WHEN m.mcc IN ('5311','5331','5651','5699','5999') THEN 'RETAIL'
+            ELSE 'UNMAPPED'
+        END AS mcc_type,
+        aa.created_date AS onboarded_date
+    FROM active_accounts aa
+    JOIN merchant_mcc_filtered m ON aa.account_id = m.account_id
+    JOIN kyc_states ks ON ks.customer_id = m.customer_id
+),
+
+user_labels AS (
+    SELECT
+        b.user_id,
+        b.account_id,
+        b.account_no,
+        b.mcc_type,
+        b.mcc,
+        b.kyc_state,
+        b.onboarded_date,
+        b.onboarded_date AS onboarded_month,
+        CASE
+            WHEN z.layer IS NULL THEN 'NON_L1'
+            WHEN z.layer = 1    THEN 'L1_FRAUD'
+            ELSE                     'MHA_FRAUD'
+        END AS user_segment
+    FROM base b
+    LEFT JOIN (
+        SELECT
+            uuid,
+            MIN(CASE WHEN layer = 0 THEN 1 ELSE layer END) AS layer
+        FROM s3_tool_propagator_pii.mha_case_registry
+        WHERE txn_nature_internal = 'C'
+        GROUP BY uuid
+    ) z ON z.uuid = b.user_id
+)
+
+-- select count(distinct user_id) from user_labels
+,
+
+
+txn_rows as (
+select
+        ul.user_id,
+        ul.account_id,
+        ul.kyc_state,
+        ul.mcc,
+        ul.user_segment,
+        t.created_at + INTERVAL '330' MINUTE                AS created_date,
+        CAST(t.amount AS DOUBLE)                             AS txn_amount,
+        t.counter_party_ifsc                                 AS debit_ifsc,
+        CASE
+            WHEN UPPER(TRIM(ifsc.state)) IS NOT NULL
+             AND UPPER(TRIM(ifsc.state)) <> UPPER(TRIM(ul.kyc_state))
+            THEN 1 ELSE 0
+        END AS is_cross_state
+    FROM upiswitch_tpap_gold.cbs_transactions t
+    JOIN user_labels ul
+        ON  ul.account_no = t.user_account_number
+        AND t.created_at + INTERVAL '330' MINUTE <= ul.onboarded_date + INTERVAL '30' DAY
+    LEFT JOIN s3_tool_propagator.ifsc_state_mapping ifsc
+        ON t.counter_party_ifsc = ifsc.ifsc
+    WHERE t.year >= 2025
+      AND date(t.created_at) >= DATE '2026-05-01'
+      AND t.txn_type IN ('CREDIT')
+      AND (t.__is_deleted IS NULL OR t.__is_deleted = false)
+      AND t.txn_status = 'SUCCESS'
+
+      UNION
+
+      SELECT
+        b.user_id,
+        b.account_id,
+        b.kyc_state,
+        b.mcc,
+        b.user_segment,
+        t.created_at + INTERVAL '330' MINUTE AS created_date,
+        CAST(amount AS DOUBLE) AS txn_amount,
+        t.counter_party_ifsc as debit_ifsc,
+        CASE
+            WHEN UPPER(TRIM(ifsc.state)) IS NOT NULL
+             AND UPPER(TRIM(ifsc.state)) <> UPPER(TRIM(b.kyc_state))
+            THEN 1 ELSE 0
+        END AS is_cross_state
+    FROM imps_switch_gold.imps_transactions t
+    join imps_switch_gold.imps_transaction_statuses ts
+    on t.id = ts.txn_id  AND ts.txn_status = 'SUCCESS'
+    JOIN user_labels b
+        ON b.account_no = t.user_account_number
+       AND t.created_at + INTERVAL '330' MINUTE <= b.onboarded_date + INTERVAL '30' DAY
+    LEFT JOIN s3_tool_propagator.ifsc_state_mapping ifsc
+        ON t.counter_party_ifsc = ifsc.ifsc
+    WHERE t.year >= 2025
+      AND date(t.created_at) >= date'2026-06-01'
+      AND t.txn_type IN ('CREDIT')
+      AND (t.__is_deleted IS NULL OR t.__is_deleted = false)
+
+      )
+
+,
+
+rolling_15m AS (
+    SELECT
+        t1.user_id,
+        t1.account_id,
+        t1.kyc_state,
+        t1.created_date                                          AS window_end,
+        COUNT(t2.txn_amount)                                     AS total_txn_count,
+        SUM(t2.txn_amount)                                       AS total_credit_sum,
+        COUNT(CASE WHEN t2.is_cross_state = 1 THEN 1 END)        AS cross_txn_count,
+        SUM(CASE WHEN t2.is_cross_state = 1 THEN t2.txn_amount END) AS cross_credit_sum,
+        COUNT(CASE WHEN t2.is_cross_state = 0 THEN 1 END)        AS same_txn_count,
+        SUM(CASE WHEN t2.is_cross_state = 0 THEN t2.txn_amount END) AS same_credit_sum
+    FROM txn_rows t1
+    JOIN txn_rows t2
+        ON  t1.user_id    = t2.user_id
+        AND t2.created_date BETWEEN t1.created_date - INTERVAL '15' MINUTE
+                                AND t1.created_date
+    GROUP BY 1, 2, 3, 4
+),
+
+user_peak_window AS (
+    SELECT
+        user_id,
+        account_id,
+        kyc_state,
+        MAX(total_credit_sum)                                    AS max_15m_credit,
+        MAX(total_txn_count)                                     AS max_15m_txn_count,
+        MAX(cross_txn_count)                                     AS max_15m_cross_state_count,
+        MAX(cross_credit_sum)                                    AS max_15m_cross_state_amount,
+        MAX(same_txn_count)                                      AS max_same_txn_count,
+        MAX(same_credit_sum)                                     AS max_same_credit,
+        -- freeze rule: ever had a window with 2+ cross and 0 same
+        -- MAX(
+        --     CASE
+        --         WHEN cross_txn_count >= 2 AND same_txn_count = 0
+        --         THEN 1 ELSE 0
+        --     END
+        -- )                                                        AS credit_freeze_flag,
+        MAX_BY(window_end, total_credit_sum)                     AS peak_window_time
+    FROM rolling_15m
+    GROUP BY 1, 2, 3
+)
+
+SELECT DISTINCT
+    ul.user_id                          AS uuid,
+    ul.account_id,
+    -- ul.kyc_state,
+    ul.mcc,
+    ul.mcc_type,
+    --ul.onboarded_month,
+    slfc.created_at,
+    ul.user_segment,
+    case when gst.gst_ref_id is null then 'no_gst'
+    else 'gst_present'
+    end as gst_flag,
+    case when sb.user_id is null then 'no_sb'
+    else 'sb_present'
+    end as sb_flag,
+    bu.bad_flag,
+    pw.*
+    -- pw.cross_state_amount_at_peak,
+    -- pw.cross_state_count_at_peak,
+    -- pw.peak_5m_same_count,
+    -- pw.peak_5m_total_count
+    -- pw.peak_5m_distinct_states,
+    -- pw.peak_5m_time
+FROM user_labels ul
+JOIN user_peak_window pw ON pw.account_id = ul.account_id
+LEFT JOIN
+(
+  SELECT decryptFunction(value) AS uuid, 1 as bad_flag
+  FROM slice_fcu_db_gold_pii.blacklist_entry
+  WHERE blacklisttypeid = 672 AND __is_deleted = FALSE
+  UNION
+  SELECT user_id, 1
+  FROM druid_gold.user_savings_details
+  WHERE txn_status <> 'NO_FREEZE' AND __is_deleted = FALSE
+) bu on bu.uuid = ul.user_id
+LEFT JOIN kycdb_gold.business_details  gst on gst.uuid = ul.user_id
+LEFT JOIN merchantdb_gold.user_soundbox sb on sb.user_id = ul.user_id
+LeFT JOIN slice_fcu_db_gold.onboarding_variables slfc on slfc.uuid=ul.user_id
+WHERE pw.max_15m_txn_count >= 2
+             AND pw.max_15m_credit >= 30000
+             AND pw.max_15m_cross_state_count >= 5
+             AND CAST(slfc.created_at AS DATE)
+                BETWEEN DATE '2026-05-01' AND DATE '2026-06-12'
+
+
+SELECT
+    ul.user_segment,
+    ul.onboarded_month,
+    COUNT(DISTINCT ul.account_id)                                           AS user_count,
+    SUM(CASE WHEN pw.max_15m_txn_count >= 10
+             AND pw.max_15m_credit >= 30000 THEN 1 ELSE 0 END)             AS flagged_10txn_30k,
+    SUM(CASE WHEN pw.max_15m_txn_count >= 5
+             AND pw.max_15m_credit >= 10000 THEN 1 ELSE 0 END)             AS flagged_5txn_10k,
+    SUM(CASE WHEN pw.max_15m_cross_state_count >= 5 THEN 1 ELSE 0 END)     AS flagged_cross_state_5plus_txns,
+    SUM(CASE WHEN pw.max_15m_cross_state_count >= 10 THEN 1 ELSE 0 END)    AS flagged_cross_state_10plus_txns,
+    SUM(CASE WHEN pw.max_15m_cross_state_amount >= 10000 THEN 1 ELSE 0 END) AS flagged_cross_state_10k_plus,
+    SUM(CASE WHEN pw.max_15m_cross_state_amount >= 30000 THEN 1 ELSE 0 END) AS flagged_cross_state_30k_plus,
+    SUM(CASE WHEN pw.max_15m_txn_count >= 2
+             AND pw.max_15m_credit >= 30000
+             AND pw.max_15m_cross_state_count >= 5 THEN 1 ELSE 0 END)      AS flagged_2txn_30k_cross_state,
+
+     SUM(CASE WHEN pw.max_15m_txn_count >= 2
+             AND pw.max_15m_credit >= 30000
+             AND pw.max_same_txn_count = 0
+             AND pw.max_15m_cross_state_count >= 2 THEN 1 ELSE 0 END)      AS flagged_2txn_30k_pure_cross_state,
+    ROUND(SUM(CASE WHEN pw.max_15m_cross_state_count >= 5 THEN 1 ELSE 0 END) * 100.0
+          / NULLIF(COUNT(DISTINCT ul.account_id), 0), 2)                    AS pct_cross_state_5plus,
+    ROUND(SUM(CASE WHEN pw.max_15m_txn_count >= 10
+                   AND pw.max_15m_credit >= 30000
+                   AND pw.max_15m_cross_state_count >= 5 THEN 1 ELSE 0 END) * 100.0
+          / NULLIF(COUNT(DISTINCT ul.account_id), 0), 2)                    AS pct_combined_cross_state
+FROM user_labels ul
+LEFT JOIN user_peak_window pw ON pw.account_id = ul.account_id
+GROUP BY 1, 2
+ORDER BY 1, 2
