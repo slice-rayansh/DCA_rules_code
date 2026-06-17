@@ -1,0 +1,28 @@
+SELECT
+  *
+FROM s3_tool_propagator_pii.dca_fraud_base_data s
+left join kycdb_gold.business_details b on s.uuid=b.uuid
+--left join onboarding_v2_gold.udyam_autofetch ud on s.uuid=ud.user_uuid
+WHERE 
+
+s.kyc_state IN (
+    'Rajasthan',
+    'Uttar Pradesh',
+    'West Bengal',
+    'Madhya Pradesh',
+    'Andhra Pradesh',
+    'Jammu and Kashmir',
+    'Karnataka',
+    'Tamil Nadu',
+    'Telangana'
+)
+
+AND CAST(s.onboarding_date AS DATE) BETWEEN DATE '2026-06-01' AND DATE '2026-06-16'
+AND s.vkyc_reverse_contact_count>0
+--AND b.estimated_annual_turnover IN (
+  --'BETWEEN_1_AND_5_LAKHS', 'BETWEEN_10_AND_20_LAKHS', 'BETWEEN_40_AND_50_LAKHS', 'BETWEEN_1_AND_5_CRORES'
+--)
+--AND ud.udyam_ref is null 
+and b.gst_ref_id is null 
+--and ud.user_uuid is not null 
+and b.udyam_is_verified = false
