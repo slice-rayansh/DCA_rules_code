@@ -1,0 +1,44 @@
+%%pretty
+df = spark.sql("""WITH round_1k_24hr AS (
+    SELECT DISTINCT
+        a1.account_no
+    FROM cyber_crime_gold.final_view_deduped a1
+    JOIN cyber_crime_gold.final_view_deduped a2
+        ON a1.account_no = a2.account_no
+        AND a2.txn_nature = 'C'
+        AND CAST(a2.txn_amount AS BIGINT) % 1000 = 0  -- round 1000 credits
+        AND a2.transactiontime BETWEEN a1.transactiontime AND a1.transactiontime + INTERVAL '24' HOUR  -- 24hr rolling window
+    JOIN upiswitch_tpap_gold.cbs_transactions tt2
+        ON a2.src_txn_id = tt2.src_txn_id
+        AND tt2.initiation_mode IN ('00','04','05','06','07','08','09','10','11','12','14')  -- non QR
+    WHERE a1.txn_nature = 'C'
+      AND CAST(a1.txn_amount AS BIGINT) % 1000 = 0 
+      and CAST(a1.txn_date AS DATE) BETWEEN DATE '2026-06-01' AND DATE '2026-06-18'-- round 1000 credits
+      and CAST(a2.txn_date AS DATE) BETWEEN DATE '2026-06-01' AND DATE '2026-06-18'-- round 1000 credits
+    GROUP BY a1.account_no, a1.transactiontime
+    HAVING SUM(a2.txn_amount) >= 40000
+)
+
+SELECT
+    b.user_id,
+    COUNT(DISTINCT a.counter_party_cbs_name) AS distinct_cp_count,
+    SUM(a.txn_amount)                        AS txn_amount
+FROM cyber_crime_gold.final_view_deduped a
+JOIN druid_gold.user_savings_details b
+    ON a.account_no = b.account_number
+   AND b.__is_deleted = FALSE
+JOIN upiswitch_tpap_gold.cbs_transactions tt
+    ON a.src_txn_id = tt.src_txn_id
+JOIN round_1k_24hr r
+    ON a.account_no = r.account_no
+JOIN slice_fcu_db_gold.onboarding_variables  aa
+    ON b.user_id = aa.uuid
+WHERE a.txn_nature = 'C'
+  AND a.transactiontime <= b.onboarding_date + INTERVAL '30' DAY  -- within 30 days of onboarding
+  AND CAST(b.onboarding_date AS DATE) BETWEEN DATE '2026-06-01' AND DATE '2026-06-18'
+  AND tt.initiation_mode IN ('00','04','05','06','07','08','09','10','11','12','14')  -- non QR
+  AND aa.current_address_state IN ('Rajasthan', 'West Bengal')
+  AND aa.itc_flag IN ('RED', 'YELLOW')
+  AND aa.gst_number IS NULL  -- GST not present
+GROUP BY 1
+""").show(100,0)
