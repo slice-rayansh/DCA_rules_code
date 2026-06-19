@@ -1,0 +1,171 @@
+WITH merchant_mcc AS (
+    SELECT DISTINCT
+        a.mcc,
+        e.user_id,
+        d.account_id,
+        d.customer_id,
+        d.account_no
+    FROM merchantdb_gold.merchant_info a
+    JOIN merchantdb_gold.merchant_orchestrator b
+        ON a.id = b.merchant_info_id
+    JOIN merchantdb_gold_pii.settlement_bank_account c
+        ON b.virtual_account_number = c.virtual_account_number
+    JOIN bsgcore_gold.customer_accounts d
+        ON decryptFunction(c.account_number) = d.account_no
+    JOIN druid_gold.user_savings_details e
+        ON e.account_number = d.account_no
+       AND e.__is_deleted = FALSE
+),
+
+base AS (
+    SELECT
+        b.account_id,
+        m.user_id,
+        m.customer_id,
+        m.account_no,
+        m.mcc,
+        ks.kyc_state,
+        CASE
+            WHEN m.mcc IN ('5411') THEN 'GROCERY'
+            WHEN m.mcc IN ('5699','5999') THEN 'RETAIL'
+        END AS mcc_type,
+        CAST(b.created_date AS DATE) AS onboarded_date
+    FROM bsgcore_gold_pii.account_master b
+    JOIN merchant_mcc m ON b.account_id = m.account_id
+    JOIN (
+        SELECT
+            ca.customer_id,
+            ptd.data_description AS kyc_state
+        FROM (
+            SELECT
+                customer_id,
+                state_code,
+                ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY address_type_code) AS rn
+            FROM bsgcrm_gold.customer_address
+            WHERE __is_deleted = false AND is_active = 1
+        ) ca
+        JOIN bsgmaster_gold.picklist_type_data ptd
+            ON ptd.type_code = 4
+           AND ptd.__is_deleted = false
+           AND ptd.is_active = true
+           AND ca.state_code = ptd.data_code
+        WHERE ca.rn = 1
+          AND lower(ptd.data_description) IN (
+              'andhra pradesh',
+              'haryana',
+              'jharkhand',
+              'madhya pradesh',
+              'rajasthan',
+              'bihar'
+          )
+    ) ks ON ks.customer_id = m.customer_id
+    WHERE b.is_active = 1
+      AND b.__is_deleted = false
+      AND b.product_code = 1150
+      AND CAST(b.created_date AS DATE) >= DATE '2026-06-01'
+      AND CAST(b.created_date AS DATE) <= DATE '2026-06-18'
+      AND m.mcc IN ('5411','5699','5999')
+),
+
+user_labels AS (
+    SELECT
+        b.user_id,
+        b.account_id,
+        b.account_no,
+        b.mcc_type,
+        b.kyc_state,
+        date_trunc('month', b.onboarded_date) AS onboarded_month,
+        b.onboarded_date,
+        CASE
+            WHEN z.layer = 1 THEN 'L1_FRAUD'
+            ELSE 'NON_L1'
+        END AS user_segment
+    FROM base b
+    LEFT JOIN (
+        SELECT
+            uuid,
+            MIN(CASE WHEN layer = 0 THEN 1 ELSE layer END) AS layer
+        FROM s3_tool_propagator_pii.mha_case_registry
+        WHERE txn_nature_internal = 'C'
+        GROUP BY uuid
+    ) z ON z.uuid = b.user_id
+),
+
+txn_rows AS (
+    SELECT
+        ul.user_id,
+        ul.user_segment,
+        ul.kyc_state,
+        ul.onboarded_date,
+        -- Keep as TIMESTAMP for the 5-min window join to work
+        CAST(t.created_at + INTERVAL '330' MINUTE AS TIMESTAMP)    AS txn_ts,
+        CAST(t.created_at + INTERVAL '330' MINUTE AS DATE)         AS txn_date,
+        CAST(t.amount AS DOUBLE)                                    AS amount,
+        CASE
+            WHEN ifsc.state IS NOT NULL
+             AND ifsc.state <> UPPER(TRIM(ul.kyc_state))
+            THEN 1 ELSE 0
+        END                                                         AS is_cross_state
+    FROM upiswitch_tpap_gold.cbs_transactions t
+    JOIN user_labels ul
+        ON t.user_account_number = ul.account_no
+       AND CAST(t.created_at + INTERVAL '330' MINUTE AS DATE) < ul.onboarded_date + INTERVAL '11' DAY
+    LEFT JOIN s3_tool_propagator.ifsc_state_mapping  ifsc
+        ON t.counter_party_ifsc = ifsc.ifsc
+    WHERE t.year >= 2026
+      AND t.txn_type  IN ('DEBIT','PAY')
+      AND t.txn_status = 'SUCCESS'
+      AND (t.__is_deleted IS NULL OR t.__is_deleted = false)
+),
+
+rolling_5m AS (
+    SELECT
+        t1.user_id,
+        t1.kyc_state,
+        t1.txn_ts                           AS window_end,
+        COUNT(t2.amount)                    AS window_txn_count,
+        SUM(t2.amount)                      AS window_credit_sum,
+        -- This is the key condition: same-state debits in the 5-min window must be zero
+        SUM(CASE WHEN t2.is_cross_state = 0 THEN 1 ELSE 0 END) AS window_same_state_count
+    FROM txn_rows t1
+    JOIN txn_rows t2
+        ON t1.user_id = t2.user_id
+       AND t2.txn_ts >= t1.txn_ts - INTERVAL '5' MINUTE   -- ✅ TIMESTAMP comparison works
+       AND t2.txn_ts <= t1.txn_ts
+    GROUP BY 1, 2, 3
+),
+
+user_peak_window AS (
+    SELECT
+        user_id,
+        kyc_state,
+        MAX(window_credit_sum)                                  AS max_5m_credit,
+        MAX(window_txn_count)                                   AS max_5m_txn_count,
+        -- worst-case same-state count at the peak-credit window
+        MAX_BY(window_same_state_count, window_credit_sum)      AS same_state_count_at_peak
+    FROM rolling_5m
+    GROUP BY 1, 2
+)
+
+SELECT DISTINCT
+    ul.onboarded_month,
+    ul.user_id,
+    ul.user_segment,
+    ul.kyc_state,
+    ul.mcc_type,
+    pw.max_5m_credit,
+    pw.max_5m_txn_count,
+    pw.same_state_count_at_peak,
+    CASE
+        WHEN pw.max_5m_credit >= 20000
+         AND pw.same_state_count_at_peak = 0
+        THEN 'flagged'
+        ELSE 'unflagged'
+    END AS flag_20k_zero_same_state
+FROM user_labels ul
+LEFT JOIN user_peak_window pw ON pw.user_id = ul.user_id
+left join druid_gold.user_savings_details drr on ul.user_id=drr.user_id
+where pw.max_5m_credit >= 20000
+         AND pw.same_state_count_at_peak = 0
+         AND CAST(drr.onboarding_date as DATE) between date '2026-06-01' and date '2026-06-18'
+ORDER BY ul.onboarded_month, ul.user_id
