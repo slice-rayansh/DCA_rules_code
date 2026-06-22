@@ -1,0 +1,179 @@
+WITH merchant_mcc AS (
+    SELECT DISTINCT
+        a.mcc, e.user_id, d.account_id, d.customer_id, d.account_no
+    FROM merchantdb_gold.merchant_info a
+    JOIN merchantdb_gold.merchant_orchestrator b ON a.id = b.merchant_info_id
+    JOIN merchantdb_gold_pii.settlement_bank_account c ON b.virtual_account_number = c.virtual_account_number
+    JOIN bsgcore_gold.customer_accounts d ON decryptFunction(c.account_number) = d.account_no
+    JOIN druid_gold.user_savings_details e ON e.account_number = d.account_no AND e.__is_deleted = FALSE
+),
+
+base_base AS (
+    SELECT
+        b.account_id, m.user_id, m.customer_id, m.account_no, m.mcc,
+        ks.kyc_state,
+        b.branch_code,
+        DATE(COALESCE(b.account_open_date, b.created_date)) AS onboarded_date,
+        ROW_NUMBER() OVER (
+                PARTITION BY m.user_id
+                ORDER BY COALESCE(b.account_open_date, b.created_date) ASC, b.account_id ASC
+            ) AS rn
+    FROM bsgcore_gold.account_master b
+    JOIN merchant_mcc m ON b.account_id = m.account_id
+    JOIN (
+        SELECT ca.customer_id, ptd.data_description AS kyc_state
+        FROM (
+            SELECT customer_id, state_code,
+                   ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY address_type_code) AS rn
+            FROM bsgcrm_gold.customer_address
+            WHERE __is_deleted = false AND is_active = 1
+        ) ca
+        JOIN bsgmaster_gold.picklist_type_data ptd
+            ON ptd.type_code = 4 AND ptd.__is_deleted = false AND ptd.is_active = true
+           AND ca.state_code = ptd.data_code
+        WHERE ca.rn = 1
+          AND lower(ptd.data_description) IN ('jharkhand','madhya pradesh','rajasthan','haryana')
+    ) ks ON ks.customer_id = m.customer_id
+    WHERE b.is_active = 1 AND b.__is_deleted = false AND b.product_code = 1150
+      AND m.mcc IN ('5411','5699','5999','5960')
+),
+
+base AS (
+    SELECT * FROM base_base
+    WHERE rn = 1
+      AND onboarded_date BETWEEN DATE '2025-10-01' AND DATE '2026-04-30'
+),
+
+user_labels AS (
+    SELECT
+        b.user_id, b.account_id, b.account_no, b.customer_id, b.mcc, b.kyc_state, b.onboarded_date, b.branch_code,
+        CASE WHEN z.layer = 1 THEN 'L1_FRAUD' ELSE 'NON_L1' END AS user_segment,
+        SUM(CASE WHEN udyam_ref IS NOT NULL THEN 1 ELSE 0 END) AS udyam_autofetched_flag
+    FROM base b
+    LEFT JOIN (
+        SELECT cif, MIN(CASE WHEN layer = 0 THEN 1 ELSE layer END) AS layer
+        FROM s3_tool_propagator_pii.mha_case_registry
+        WHERE txn_nature_internal = 'C'
+        GROUP BY 1
+    ) z ON z.cif = CAST(b.customer_id AS varchar)
+    LEFT JOIN onboarding_v2_gold.udyam_autofetch ua ON ua.user_uuid = b.user_id
+    GROUP BY 1,2,3,4,5,6,7,8,9
+),
+
+txns_30d AS (
+    SELECT ul.user_id, ul.account_id,
+           t.txn_nature,
+           t.created_date + INTERVAL '330' MINUTE AS txn_ts,
+           CAST(t.txn_amount AS DOUBLE) AS amount
+    FROM (
+        SELECT account_id, txn_nature, txn_amount, created_date
+        FROM bsgaccounting_gold.transaction_master
+        WHERE is_active = true AND (__is_deleted IS NULL OR __is_deleted = false)
+          AND year >= 2025
+        UNION ALL
+        SELECT account_id, txn_nature, txn_amount, created_date
+        FROM bsgdeepfreeze_gold.transaction_master_df
+        WHERE is_active = true AND (__is_deleted IS NULL OR __is_deleted = false)
+          AND year >= 2025
+    ) t
+    JOIN user_labels ul ON t.account_id = ul.account_id
+    WHERE CAST(t.created_date AS DATE) <= ul.onboarded_date + INTERVAL '30' DAY
+),
+
+rolling_24h AS (
+    SELECT
+        t1.user_id,
+        t1.txn_ts AS window_end,
+        COUNT(*)                                                                           AS credit_count_24h,
+        CAST(COUNT(CASE WHEN t2.amount % 100 != 0 THEN 1 END) * 1.0 / COUNT(*) AS DOUBLE) AS pct_non_round_100_24h,
+        COUNT(CASE WHEN t2.amount % 1000 = 0 THEN 1 END)                                  AS round_1000_count_24h,
+        COUNT(CASE WHEN t2.amount % 100 = 0  THEN 1 END)                                  AS round_100_count_24h,
+        CAST(COUNT(CASE WHEN t2.amount % 1000 = 0 THEN 1 END) * 1.0 / COUNT(*) AS DOUBLE) AS pct_round_1000_24h,
+        CAST(COUNT(CASE WHEN t2.amount % 100 = 0  THEN 1 END) * 1.0 / COUNT(*) AS DOUBLE) AS pct_round_100_24h,
+        COUNT(CASE WHEN t2.amount % 1000 != 0 THEN 1 END)                                 AS non_round_1000_count_24h,
+        COUNT(CASE WHEN t2.amount % 100 != 0  THEN 1 END)                                 AS non_round_100_count_24h,
+        COUNT(DISTINCT CASE WHEN t2.amount % 1000 != 0 THEN t2.amount END)                AS distinct_non_round_1000_24h,
+        COUNT(DISTINCT CASE WHEN t2.amount % 100 != 0  THEN t2.amount END)                AS distinct_non_round_100_24h,
+        -- Adding distinct round 1000 amounts
+        COUNT(DISTINCT CASE WHEN t2.amount % 1000 = 0 THEN t2.amount END)                 AS distinct_round_1000_24h
+    FROM txns_30d t1
+    JOIN txns_30d t2
+        ON t1.user_id = t2.user_id
+       AND t2.txn_ts BETWEEN t1.txn_ts - INTERVAL '24' HOUR AND t1.txn_ts
+    WHERE t1.txn_nature = 'C'
+      AND t2.txn_nature = 'C'
+    GROUP BY 1, 2
+),
+
+rolling_24h_dc AS (
+    SELECT
+        t1.user_id,
+        t1.txn_ts AS window_end,
+        SUM(CASE WHEN t2.txn_nature = 'C' THEN t2.amount ELSE 0 END) AS credit_amt_24h,
+        SUM(CASE WHEN t2.txn_nature = 'D' THEN t2.amount ELSE 0 END) AS debit_amt_24h,
+        SUM(CASE WHEN t2.txn_nature = 'D' THEN t2.amount ELSE 0 END)
+            / NULLIF(SUM(CASE WHEN t2.txn_nature = 'C' THEN t2.amount ELSE 0 END), 0) AS dc_ratio_24h
+    FROM txns_30d t1
+    JOIN txns_30d t2
+        ON t1.user_id = t2.user_id
+       AND t2.txn_ts BETWEEN t1.txn_ts - INTERVAL '24' HOUR AND t1.txn_ts
+    WHERE t1.txn_nature = 'C'
+    GROUP BY 1, 2
+),
+
+user_peak_round AS (
+    SELECT
+        r.user_id,
+        MAX(r.pct_round_1000_24h)                                           AS max_pct_round_1000,
+        MAX(r.pct_round_100_24h)                                            AS max_pct_round_100,
+        MAX_BY(r.credit_count_24h, r.pct_round_1000_24h)                    AS credit_count_at_peak_1000,
+        MAX_BY(r.credit_count_24h, r.pct_round_100_24h)                     AS credit_count_at_peak_100,
+        MIN_BY(r.credit_count_24h, r.pct_round_1000_24h)                    AS credit_count_at_low_1000,
+        MIN_BY(r.credit_count_24h, r.pct_round_100_24h)                     AS credit_count_at_low_100,
+        MAX_BY(r.non_round_1000_count_24h, r.pct_round_1000_24h)            AS non_round_1000_at_peak,
+        MAX_BY(r.non_round_100_count_24h, r.pct_round_1000_24h)             AS non_round_100_at_peak,
+        MAX_BY(r.distinct_non_round_1000_24h, r.pct_round_1000_24h)         AS distinct_non_round_1000_at_peak,
+        MAX_BY(r.distinct_non_round_100_24h, r.pct_round_1000_24h)          AS distinct_non_round_100_at_peak,
+        MAX_BY(dc.dc_ratio_24h, r.pct_round_1000_24h)                       AS dc_ratio_at_peak,
+        MAX_BY(dc.credit_amt_24h, r.pct_round_1000_24h)                     AS credit_amt_at_peak,
+        MAX_BY(dc.debit_amt_24h, r.pct_round_1000_24h)                      AS debit_amt_at_peak,
+        MAX_BY(r.pct_non_round_100_24h, r.pct_round_1000_24h)               AS pct_non_round_100_at_peak,
+        -- Distinct round 1000 amounts at peak
+        MAX_BY(r.distinct_round_1000_24h, r.pct_round_1000_24h)             AS distinct_round_1000_at_peak
+    FROM rolling_24h r
+    JOIN rolling_24h_dc dc
+        ON r.user_id = dc.user_id
+       AND r.window_end = dc.window_end
+    GROUP BY 1
+)
+
+SELECT
+    ul.user_id,
+    date_trunc('month',ul.onboarded_date) as onboarding_month,
+    ul.user_segment,
+    ul.kyc_state,
+    ul.branch_code,
+    ul.mcc,
+    CASE WHEN bd.gst_ref_id IS NULL THEN 'no_gst' ELSE 'gst_present' END AS gst_flag,
+    COALESCE(pr.max_pct_round_1000, 0)                AS max_pct_round_1000,
+    COALESCE(pr.credit_count_at_peak_1000, 0)         AS total_credits_at_peak,
+    COALESCE(pr.max_pct_round_100, 0)                 AS max_pct_round_100,
+    COALESCE(pr.credit_count_at_peak_100, 0)          AS max_credit_count_100,
+    COALESCE(pr.debit_amt_at_peak, 0)                 AS debit_amt_at_peak,
+    COALESCE(pr.distinct_round_1000_at_peak, 0)       AS distinct_round_1000_at_peak,
+    COALESCE(pr.dc_ratio_at_peak, 0)                  AS dc_ratio_at_peak,
+    COALESCE(pr.credit_amt_at_peak, 0)                AS credit_amt_at_peak,
+    COALESCE(pr.pct_non_round_100_at_peak, 0)         AS pct_non_round_100_at_peak
+FROM user_labels ul
+LEFT JOIN user_peak_round pr ON pr.user_id = ul.user_id
+LEFT JOIN (
+    SELECT uuid, gst_ref_id,
+           ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY created_at DESC) AS rk
+    FROM kycdb_gold.business_details
+    WHERE __is_deleted = FALSE OR __is_deleted IS NULL
+) AS bd ON bd.uuid = ul.user_id AND bd.rk = 1
+WHERE ul.udyam_autofetched_flag = 0                          -- udyam NOT autofetched
+  AND bd.gst_ref_id IS NULL                                  -- no GST
+  AND COALESCE(pr.credit_count_at_peak_1000, 0) >= 10       -- 10+ credits at peak
+  AND COALESCE(pr.debit_amt_at_peak, 0) > 20000             -- debit > 20k at peak
+  AND COALESCE(pr.distinct_round_1000_at_peak, 0) > 2       -- >2 distinct round-1000 amounts
