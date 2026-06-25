@@ -1,0 +1,447 @@
+import os
+from pyspark.sql import SparkSession
+spark_session_id = os.path.basename(__file__).replace('.py', '')
+spark = SparkSession.builder.appName(spark_session_id).getOrCreate()
+
+from emr_spark_utils.fraud_utils import CHECKS_DCA
+
+from decimal import Decimal
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+import openpyxl as xl
+from openpyxl.utils import get_column_interval
+from openpyxl.utils.dataframe import dataframe_to_rows
+import re
+import json
+import operator
+import boto3
+import email
+import smtplib
+import ssl
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import time
+import enum
+from pyspark.sql import SparkSession
+import math
+import io
+from pyspark.sql import functions as F
+import pytz
+import requests
+
+from pyspark.sql.functions import col, split, get_json_object, date_sub, current_timestamp, max as spark_max, min as spark_min, collect_list, slice
+from pyspark.sql.types import DoubleType
+
+from pyspark.sql.functions import col, split, get_json_object, current_date, date_sub, year, month, dayofmonth, broadcast, expr, sort_array, struct
+from pyspark.sql.types import DoubleType
+
+from pyspark.sql.functions import explode, row_number
+
+from pyspark.sql.window import Window
+# Compute yesterday and today
+yesterday = date_sub(current_date(), 1)
+today = current_date()
+
+
+s3 = boto3.client('s3')
+date_yesterday = datetime.now() - timedelta(days=1)
+
+date_yesterday_str = date_yesterday.strftime('%Y-%m-%d')
+
+def get_secrets(secret_name):
+    region_name = "ap-south-1"
+    session = boto3.session.Session()
+
+    client = session.client(service_name="secretsmanager", region_name=region_name)
+
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+
+    except ClientError as e:
+        if e.response.get("Error").get("Code") == "ResourceNotFoundException":
+            raise Exception("The requested secret " + secret_name + " was not found")
+        elif e.response.get("Error").get("Code") == "InvalidRequestException":
+            raise Exception("The request was invalid due to:", e)
+        else:
+            raise Exception("The request failed because of:", e)
+
+    secret = get_secret_value_response.get("SecretString")
+
+    if isinstance(secret, str):
+        secret = eval(secret)
+
+    return secret
+
+MSSQL_ANALYTICS_CLUSTER_COMMON = "prod/data/analytics/cbs/common" #verified
+BANKOS = "prod/data/analytics/bankos"
+MIS_8004 = "prod/data/analytics/cbs/mis_8004"
+MIS_2397 = "prod/data/analytics/cbs/mis_2397"
+BANK_KYC = "prod/data/analytics/bank_kyc"
+BANK_KYC_RW = "prod/data/analytics/bankkyc_rw"
+BANK_ONBOARDING_DB = "prod/data/analytics/bank_onboarding"
+BANK_ONBOARDING_DB_RW = "prod/data/analytics/bank_onboarding_rw"
+COMMON_TOKEN = 'prod/data/analytics/common-token'
+SUNRISE_MAIL = 'prod/data/analytics/sunrise-mail'
+BANK_PAYMENT_LINKS_ACCESS_TOKEN_V2  = 'prod/data/analytics/bank-payment-links-access-token-v2'
+BANK_PAYMENT_LINKS_ACCESS_TOKEN_V3  = 'prod/data/analytics/bank-payment-links-access-token-v3'
+RAZORPAY = 'prod/data/analytics/cbs/razorpay'
+HELO_AI = 'prod/data/analytics/heloai'
+SERVICE_TOKEN = 'prod/data/analytics/service-token'
+CONFLUENT_TOKEN = 'prod/data/analytics/confluent-token'
+
+    
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+from datetime import datetime
+slack_token =get_secrets(COMMON_TOKEN)["slack_token"]
+client = WebClient(token=slack_token)
+
+spark.udf.registerJavaFunction("decryptFunction", "com.piixie.SparkDecrypt")
+
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', None)
+
+from pyspark.sql.functions import split, col, udf , lit
+from pyspark.sql.types import DoubleType
+import pygeohash as pgh
+def get_geohash(lat, long, precision):
+    if lat is None : 
+        lat = 0.0000
+    else : 
+        lat = lat
+    if long is None : 
+        long = 0.0000
+    else :
+        long = long
+    return pgh.encode(lat, long, precision)
+
+udf_get_geohash = udf(get_geohash)
+
+def push_to_slack(df1):
+    channel_id = "C0958LSLM8Q"
+    df1.to_csv('./sample.csv', index=False)
+    if df1.shape[0] > 0 : 
+        client.files_upload_v2(
+        channel = channel_id,
+        title = "df_base",
+        file = "./sample.csv",
+        initial_comment="df_base",
+        )
+        print(f'pushed to slack: {channel_id}')
+
+def load_from_s3(path, view_name):
+    data = spark.read.parquet(path)
+    data.createOrReplaceTempView(view_name)
+    
+    return data
+    
+def load_csv(path, view_name):    
+    import pandas as pd
+    import io
+    import boto3
+
+    # Parse S3 path
+    path = path.replace("s3://", "")
+    bucket_name = path.split("/")[0]
+    key = "/".join(path.split("/")[1:])
+
+    # Read from S3 using boto3
+    s3 = boto3.client('s3')
+    obj = s3.get_object(Bucket=bucket_name, Key=key)
+
+    # Read Excel with pandas
+    data = io.BytesIO(obj['Body'].read())
+    df = pd.read_csv(data)
+
+    # Convert to Spark DataFrame
+    df = spark.createDataFrame(df)
+
+    # Create temporary view
+    df.createOrReplaceTempView(view_name)
+
+def load_excel(path, view_name):
+    path = path.replace("s3://", "")
+    bucket_name = path.split("/")[0]
+    key = "/".join(path.split("/")[1:])
+
+    # Read from S3 using boto3
+    s3 = boto3.client('s3')
+    obj = s3.get_object(Bucket=bucket_name, Key=key)
+
+    # Read Excel with pandas
+    excel_data = io.BytesIO(obj['Body'].read())
+    df = pd.read_excel(excel_data)
+    df.columns = df.columns.str.strip()
+
+    # Convert to Spark DataFrame
+    blocked_df = spark.createDataFrame(df)
+    blocked_df.createOrReplaceTempView(view_name)
+    
+    return blocked_df
+
+from pyspark.sql.functions import split, col, udf , lit
+from pyspark.sql.types import DoubleType
+import pygeohash as pgh
+def get_geohash(lat, long, precision):
+    if lat is None : 
+        lat = 0.0000
+    else : 
+        lat = lat
+    if long is None : 
+        long = 0.0000
+    else :
+        long = long
+    return pgh.encode(lat, long, precision)
+
+udf_get_geohash = udf(get_geohash)
+
+######### TOKEN SET RATIO
+
+from pyspark.sql.functions import udf, col, when
+from pyspark.sql.types import IntegerType
+import re
+from difflib import SequenceMatcher
+
+def tokenize(s):
+    if s is None:
+        return []
+    s = re.sub(r'[^a-zA-Z0-9 ]', '', s.lower())
+    return s.split()
+
+def ratio(s1, s2):
+    return int(SequenceMatcher(None, s1, s2).ratio() * 100)
+
+def token_set_ratio(s1, s2):
+    if s1 is None or s2 is None:
+        return 0
+    
+    tokens1 = set(tokenize(s1))
+    tokens2 = set(tokenize(s2))
+    
+    common_tokens = tokens1.intersection(tokens2)
+    diff1 = tokens1.difference(tokens2)
+    diff2 = tokens2.difference(tokens1)
+    
+    sorted_common = ' '.join(sorted(common_tokens))
+    sorted_diff1 = ' '.join(sorted(diff1))
+    sorted_diff2 = ' '.join(sorted(diff2))
+    
+    # Combine strings in three ways and calculate ratio
+    combined1 = sorted_common + ' ' + sorted_diff1
+    combined2 = sorted_common + ' ' + sorted_diff2
+    
+    ratios = [
+        ratio(sorted_common, combined1),
+        ratio(sorted_common, combined2),
+        ratio(combined1, combined2),
+    ]
+    
+    return max(ratios)
+
+
+token_set_ratio_udf = udf(token_set_ratio, IntegerType())
+
+base_df = spark.sql("""
+SELECT 
+    a.user_id as uuid,
+    a.account_number,
+    a.customer_id,
+    a.onboarding_date,
+    a.txn_status
+FROM druid_gold.user_savings_details a
+JOIN bsgcore_gold.customer_accounts b on a.account_number = b.account_no and b.__is_deleted = False and b.is_active = 1
+JOIN bsgcore_gold.account_master c on b.account_id = c.account_id and c.is_active = 1 and c.__is_deleted=False and c.product_code = 1150
+""")
+
+base_df.persist()
+
+base_df.createOrReplaceTempView('dca_base')
+
+spark.sql("""
+SELECT *
+FROM (
+    SELECT 
+        a.customer_id, 
+        b.data_description as kyc_state, 
+        a.pin_code as kyc_pincode,
+        row_number() over(partition by customer_id order by address_type_code) as rn
+    FROM bsgcrm_gold.customer_address a
+    JOIN bsgmaster_gold.picklist_type_data b on b.type_code = 4 and b.__is_deleted = False and b.is_active = true and a.state_code = b.data_code
+    where a.__is_deleted = false and a.is_active = 1
+)
+where rn = 1
+""").createOrReplaceTempView("kyc_data")
+
+login_df = spark.sql("""
+SELECT 
+    uuid, 
+    device_id, 
+    LEAD(device_id) over(partition by uuid order by login_time) as next_device_id,
+    ip,
+    login_time,
+    LEAD(login_time) over(partition by uuid order by login_time) as next_login_time,
+    source
+FROM (
+    select customer_id as uuid,device_id,ip,created_at as login_time,source from uid_db_gold.customer_login_logs WHERE year >= 2026 and source <> 'EMAIL'
+    UNION 
+    select customer_id as uuid,device_id,ip,created_at as login_time,source from uid_db_gold.customer_signup_log WHERE year >= 2026 and source <> 'EMAIL'
+)
+""")
+
+login_df.createOrReplaceTempView("login_logs_data")
+
+rc_df = spark.sql("""
+select 
+    a.uuid,
+    count(distinct uuid_saved_by) as cnt_total_rc
+from data_sync_db_pii.slice_x_application_base_reverse_contacts a
+where 1=1 
+    and a.uuid_saved_by <> a.uuid
+group by 1
+""")
+
+rc_df.createOrReplaceTempView("rc_data")
+
+spark.sql("""
+SELECT 
+    uuid, 
+    device_id, 
+    next_device_id,
+    next_login_time as device_change_time,
+    1 as device_change_flag
+FROM login_logs_data a
+WHERE next_device_id <> device_id
+""").createOrReplaceTempView('dc_data')
+
+spark.sql("""
+SELECT 
+    user_uuid, 
+    src_txn_id,
+    narration,
+    debit_party_type,
+    credit_party_type
+FROM casa_txn_gold.transaction
+WHERE year = 2026 
+""").createOrReplaceTempView('casa_data')
+
+df = spark.sql("""
+SELECT 
+    a.*, 
+    b.account_open_date as onboarding_date,
+    c.narration as casa_narration,
+    c.debit_party_type,
+    c.credit_party_type,
+    d.note as upi_note
+FROM cyber_crime_gold.final_view_deduped a
+JOIN bsgcore_gold.account_master b on a.account_id = b.account_id and b.is_active = 1 and b.__is_deleted=False and b.product_code = 1150
+LEFT JOIN casa_data c on a.src_txn_id = c.src_txn_id
+LEFT JOIN upiswitch_tpap_gold.cbs_transactions d on d.year = 2026 and a.rrn = d.rrn
+""").createOrReplaceTempView('dca_txn_data')
+
+spark.sql("""
+with txn_around_dc as (
+    SELECT 
+        a.uuid,
+        a.device_id,
+        a.next_device_id,
+        a.device_change_time,
+        a.device_change_flag,
+        SUM(CASE WHEN b.transactiontime < a.device_change_time THEN txn_amount END) as amount_bef_dc,
+        SUM(CASE WHEN b.transactiontime >= a.device_change_time THEN txn_amount END) as amount_aft_dc,
+        COUNT(CASE WHEN b.transactiontime < a.device_change_time THEN txn_amount END) as count_bef_dc,
+        COUNT(CASE WHEN b.transactiontime >= a.device_change_time THEN txn_amount END) as count_aft_dc
+    FROM dc_data a
+    JOIN dca_txn_data b on a.uuid = b.uuid and b.transactiontime between a.device_change_time - INTERVAL '3' DAY and a.device_change_time + INTERVAL '3' DAY 
+    WHERE b.txn_mode <> 'IFT - Interest Credits' and narration <> 'Payment to slice merchant QR'
+    group by 1,2,3,4,5
+),
+dc_ordered as (
+    SELECT *, row_number() over(partition by uuid order by device_change_time) as rn
+    FROM txn_around_dc
+)
+SELECT 
+    uuid,
+    count(distinct device_id) as device_count,
+    sum(device_change_flag) as dc_count,
+    min(device_change_time) first_dc_time,
+    MAX(CASE WHEN rn = 1 THEN amount_bef_dc END) as amount_bef_dc_1,
+    MAX(CASE WHEN rn = 1 THEN amount_aft_dc END) as amount_aft_dc_1,
+    MAX(CASE WHEN rn = 1 THEN count_bef_dc END) as count_bef_dc_1,
+    MAX(CASE WHEN rn = 1 THEN count_aft_dc END) as count_aft_dc_1,
+    MAX(CASE WHEN rn = 2 THEN amount_bef_dc END) as amount_bef_dc_2,
+    MAX(CASE WHEN rn = 2 THEN amount_aft_dc END) as amount_aft_dc_2,
+    MAX(CASE WHEN rn = 2 THEN count_bef_dc END) as count_bef_dc_2,
+    MAX(CASE WHEN rn = 2 THEN count_aft_dc END) as count_aft_dc_2,
+    MAX(amount_aft_dc) as max_amount_aft_dc,
+    MAX_BY(amount_bef_dc, amount_aft_dc) as max_amount_bef_dc,
+    MAX_BY(count_aft_dc, amount_aft_dc) as max_count_aft_dc,
+    MAX_BY(count_bef_dc, amount_aft_dc) as max_count_bef_dc,
+    MAX_BY(rn, amount_aft_dc) as max_amount_dc_count
+FROM dc_ordered
+group by 1
+""").createOrReplaceTempView('dca_analysis_data')
+
+df = spark.sql("""
+SELECT 
+    'FREEZE' as action,
+    'Fraud bulk action: DCA Device Change High Activity' as freeze_remark,
+    106210 as employeeId,
+    2 as freezeStatus,
+    9 as regulatoryId,
+    b.account_number as accountNumber, 
+    a.uuid as uuid,
+    'CREDIT FREEZE' as freeze_action,
+    'REMOVABLE' as freeze_type,
+    'USERBLACKLISTREGISTRY' as uuid_blacklist_type,
+    'FRAUDDIRECTRULE' as user_blacklist_reason
+FROM dca_analysis_data a
+JOIN dca_base b on a.uuid = b.uuid and b.txn_status = 'NO_FREEZE'
+JOIN rc_data c on a.uuid = c.uuid
+JOIN kyc_data d on b.customer_id = d.customer_id
+WHERE 1=1
+    AND cnt_total_rc <= 10
+    AND kyc_state in ('Rajastan', 'West Bengal', 'Tamil Nadu', 'Telangana')
+    AND DATEDIFF(a.first_dc_time, b.onboarding_date) <= 30
+    AND amount_bef_dc_1 <= 5000
+    AND amount_aft_dc_1 >= 50000
+    AND count_aft_dc_1 >= 10
+""")
+
+df = (
+    df
+    .withColumn("created_at", F.current_timestamp())
+    .withColumn("partition_flag", F.col("freeze_remark"))
+)
+
+action_df = spark.table("s3_tool_propagator_pii.dca_bulk_action_automation_store")
+
+df = df.join(
+    action_df, 
+    on=["uuid", "freeze_remark"], 
+    how="left_anti"
+)
+
+df.persist()
+
+if df.count() > 0:
+    df.write.format("delta").mode("append").partitionBy("partition_flag").save("s3://ne-prod-delta-lake-secure-layer/source=fact-tables/schema=s3_tool_propagator_pii/table=dca_bulk_action_automation_store/")
+
+
+# source_date = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+
+# df = df.withColumn("source_datetime", F.lit(source_date).cast("string"))
+
+# df.persist()
+
+# uuid_list = df.select(F.col("uuid")).distinct().toPandas()["uuid"].tolist()
+
+# checks_df = CHECKS_DCA(uuid_list,2000,0)
+
+# df = df.join(checks_df, on="uuid", how="inner").select(df.columns)
+
+# df_pd = df.toPandas()
+
+# push_to_slack(df_pd)
