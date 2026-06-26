@@ -1,0 +1,687 @@
+import os
+from pyspark.sql import SparkSession
+
+spark_session_id = os.path.basename(__file__).replace(".py", "")
+spark = SparkSession.builder.appName(spark_session_id).getOrCreate()
+spark.udf.registerJavaFunction("decryptFunction", "com.piixie.SparkDecrypt")
+
+
+"""
+DCA categorical geohash waterfall — segmented cohorts with blacklist actioning.
+
+Mirrors categorical_gh_onb_decline_itcry.py structure; DCA cohort and fraud flags follow
+dca_geohash_categorical_analysis.py.
+
+- Global exclusion: (1) geo hotspot blacklist type BL (default 572) on gh5/gh6;
+  (2) CATEGORICALGEOHASH (938) with reason DCAONBOARDINGDECLINE on gh5/gh6.
+- Per-pass exclusion: existing type-938 geohashes for that pass's reason only.
+- Waterfall: GH6 then GH5 with MIN_DISTINCT_USERS / MIN_PRECISION (L1/L1SR precision).
+- API: one POST per geohash with CATEGORICALGEOHASH + pass reason key.
+
+Segments (DCA CURRENT product 1150, VKYC_COMPLETED, latest onboarding geohash):
+  1) count_of_users_on_devices >= 2  -> DCAMULTIUSERDEVICE
+  2) Udyam registration date = onboarding date (Hyperverge vs druid CURRENT) -> DCAUDYAMSAMEDAYONBOARDING
+  3) >= 1 reverse contact where uuid_saved_by is MHA L1 (credit) or L1SR -> DCAL1RCVKYCREVIEW
+
+No ITC RED/YELLOW filter (unlike DSA savings reference).
+"""
+
+import logging
+from typing import Iterable, Optional
+
+import requests
+from pyspark import StorageLevel
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+MIN_DISTINCT_USERS = 5
+MIN_PRECISION = 0.20
+BL = 572
+CATEGORICAL_GEOHASH_BLACKLIST_TYPE_ID = 938
+
+REASON_PASS1 = "DCAMULTIUSERDEVICE"
+REASON_PASS2 = "DCAUDYAMSAMEDAYONBOARDING"
+REASON_PASS3 = "DCAL1RCVKYCREVIEW"
+REASON_GLOBAL_ONBOARDING_DECLINE = "DCAONBOARDINGDECLINE"
+
+VIEW_EXISTING_R1 = "existing_categorical_geohash_dcamultiuserdevice"
+VIEW_EXISTING_R2 = "existing_categorical_geohash_dcaudyamsamedayonboarding"
+VIEW_EXISTING_R3 = "existing_categorical_geohash_dcal1rcvkycreview"
+VIEW_EXISTING_GLOBAL_ONB_DECLINE_GEOHASH = "existing_categorical_geohash_dcaonboardingdecline_global"
+
+L1SR_PARQUET = (
+    "s3://ne-prod-delta-lake-secure-layer/source=fact-tables/source=user_jobs/"
+    "source=delete_location/user=rahuljha/suspect_registry_data/combined_data/"
+)
+
+OUTPUT_PATH = (
+    "s3://ne-prod-delta-lake-secure-layer/source=fact-tables/source=user_jobs/"
+    "source=delete_location/user=viraj_jangam/dca_geo_hotspots_categorical/"
+)
+
+
+def register_setup_views(spark: SparkSession) -> None:
+    spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "LEGACY")
+    spark.conf.set("spark.sql.legacy.parquet.int96RebaseModeInRead", "LEGACY")
+
+    try:
+        (
+            spark.read.parquet(L1SR_PARQUET)
+            .filter(F.lower(F.col("filename")).like("%layer1%"))
+            .select(F.expr("right(cast(phone_number as string), 10)").alias("l1_sr_phone_num"))
+            .withColumn("l1_sr_hit", F.lit(1))
+            .distinct()
+            .createOrReplaceTempView("l1sr_phone_lookup")
+        )
+    except Exception as e:
+        logger.warning("L1 SR parquet not loaded (%s); l1_sr_flag will be 0.", e)
+        spark.sql(
+            "CREATE OR REPLACE TEMP VIEW l1sr_phone_lookup AS "
+            "SELECT CAST(NULL AS STRING) AS l1_sr_phone_num, 0 AS l1_sr_hit WHERE 1=0"
+        )
+
+    spark.sql(
+        """
+        CREATE OR REPLACE TEMP VIEW dca_users AS
+        SELECT user_id, customer_id, account_no
+        FROM (
+            SELECT
+                d.user_id,
+                ca.customer_id,
+                CAST(ca.account_no AS STRING) AS account_no,
+                ROW_NUMBER() OVER (
+                    PARTITION BY d.user_id
+                    ORDER BY COALESCE(am.account_open_date, am.created_date) ASC, am.account_id ASC
+                ) AS rn
+            FROM druid_gold.user_savings_details d
+            JOIN bsgcore_gold.customer_accounts ca
+                ON CAST(ca.account_no AS STRING) = CAST(d.account_number AS STRING)
+            JOIN bsgcore_gold.account_master am
+                ON am.account_id = ca.account_id
+                AND am.is_active = 1
+                AND COALESCE(am.__is_deleted, FALSE) = FALSE
+                AND am.product_code = 1150
+            WHERE COALESCE(d.__is_deleted, FALSE) = FALSE
+              AND COALESCE(ca.__is_deleted, FALSE) = FALSE
+              AND ca.is_active = 1
+              AND d.account_type = 'CURRENT'
+        ) z
+        WHERE rn = 1
+        """
+    )
+
+    spark.sql("""
+    CREATE OR REPLACE TEMP VIEW onboarding_users_geohash AS
+    SELECT *
+    FROM (
+        SELECT
+            a.uuid AS user_id,
+            product_type,
+            date(b.onboarding_date) as onboarding_date,
+            itc_flag,
+            device_id AS current_device_id,
+            COALESCE(count_of_users_on_devices, 0) AS count_of_users_on_devices,
+            SUBSTRING(geohash6, 1, 5) AS gh5,
+            geohash6 AS gh6,
+            ROW_NUMBER() OVER (
+                PARTITION BY a.uuid
+                ORDER BY b.created_at desc
+            ) as rn
+        FROM slice_fcu_db_gold.onboarding_variables a
+        JOIN druid_gold.user_savings_details b
+            ON a.uuid = b.user_id
+        INNER JOIN dca_users du ON du.user_id = a.uuid
+        WHERE COALESCE(a.__is_deleted, false) = false
+          AND COALESCE(b.__is_deleted, false) = false
+          AND b.account_type = 'CURRENT'
+          AND a.geohash6 IS NOT NULL
+          AND LENGTH(TRIM(a.geohash6)) >= 5
+          AND a.geohash6 <> 's00000'
+          AND a.current_stage = 'VKYC_COMPLETED'
+    ) t
+    WHERE rn = 1
+    """)
+
+    spark.sql("""
+    CREATE OR REPLACE TEMP VIEW signup_first_device_by_user AS
+    SELECT customer_id AS user_id, device_id AS first_device_id
+    FROM (
+        SELECT customer_id, device_id,
+               ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at ASC) AS rn
+        FROM uid_db_gold.customer_signup_log
+        WHERE device_id IS NOT NULL AND device_id <> ''
+    ) ranked_signups WHERE rn = 1
+    """)
+
+    spark.sql("""
+    CREATE OR REPLACE TEMP VIEW mha_layer_by_account AS
+    SELECT
+        CAST(account_number_internal AS STRING) AS account_number_internal,
+        MIN(CASE WHEN layer = 0 THEN 1 ELSE layer END) AS mha_min_layer
+    FROM s3_tool_propagator_pii.mha_case_registry
+    WHERE txn_nature_internal = 'C'
+      AND account_number_internal IS NOT NULL
+      AND LENGTH(CAST(account_number_internal AS STRING)) > 0
+    GROUP BY CAST(account_number_internal AS STRING)
+    """)
+
+    spark.sql("""
+    CREATE OR REPLACE TEMP VIEW mha_layer_by_user AS
+    SELECT
+        du.user_id,
+        MIN(a.mha_min_layer) AS mha_min_layer
+    FROM mha_layer_by_account a
+    JOIN druid_gold.user_savings_details b
+        ON CAST(a.account_number_internal AS STRING) = CAST(b.account_number AS STRING)
+    JOIN dca_users du ON du.user_id = b.user_id
+    WHERE COALESCE(b.__is_deleted, FALSE) = FALSE
+      AND b.account_type = 'CURRENT'
+    GROUP BY du.user_id
+    """)
+
+    spark.sql("""
+    CREATE OR REPLACE TEMP VIEW mha_credit_flags_by_user AS
+    SELECT
+        user_id,
+        1 AS fraud_flag,
+        CASE WHEN mha_min_layer = 1 THEN 1 ELSE 0 END AS l1_flag
+    FROM mha_layer_by_user
+    """)
+
+    spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW geo_hotspot_blacklist_{BL} AS
+    SELECT DISTINCT decryptFunction(value) AS geohash
+    FROM slice_fcu_db_gold_pii.blacklist_entry
+    WHERE blacklisttypeid = {BL}
+    AND value IS NOT NULL
+    AND COALESCE(__is_deleted, false) = false
+    """)
+
+    spark.sql("""
+    CREATE OR REPLACE TEMP VIEW freeze_flag_by_user AS
+    SELECT
+        uuid_s AS user_id,
+        CASE WHEN COALESCE(freeze_status, 0) IN (2, 3, 5) THEN 1 ELSE 0 END AS freeze_flag
+    FROM (
+        SELECT
+            c.user_id AS uuid_s,
+            a.freeze_status,
+            ROW_NUMBER() OVER (PARTITION BY a.account_id ORDER BY a.last_modified_date DESC) AS rn
+        FROM bsgcore_gold.account_multi_freeze_status a
+        JOIN bsgcore_gold.customer_accounts b ON a.account_id = b.account_id
+        JOIN druid_gold.user_savings_details c ON b.account_no = c.account_number
+    ) z WHERE rn = 1
+    """)
+
+    # --- Udyam registration date = DCA onboarding date (latest Hyperverge row) ---
+    spark.sql(
+        """
+        CREATE OR REPLACE TEMP VIEW dca_onboarding_date_for_udyam_match AS
+        SELECT
+            u.user_id,
+            DATE(
+                COALESCE(
+                    CAST(d.onboarding_date AS DATE),
+                    CAST(CAST(d.created_at AS TIMESTAMP) AS DATE)
+                )
+            ) AS onboarding_date
+        FROM dca_users u
+        INNER JOIN druid_gold.user_savings_details d
+            ON d.user_id = u.user_id
+            AND CAST(d.account_number AS STRING) = u.account_no
+        WHERE COALESCE(d.__is_deleted, FALSE) = FALSE
+          AND d.account_type = 'CURRENT'
+        """
+    )
+
+    spark.sql(
+        """
+        CREATE OR REPLACE TEMP VIEW dca_udyam_registration_date_hyperverge AS
+        SELECT
+            u.user_id,
+            DATE(CAST(h.date_of_udyam_registration AS TIMESTAMP)) AS udyam_registration_date
+        FROM dca_users u
+        INNER JOIN (
+            SELECT
+                uuid,
+                date_of_udyam_registration,
+                ROW_NUMBER() OVER (
+                    PARTITION BY uuid ORDER BY created_at DESC NULLS LAST, updated_at DESC NULLS LAST
+                ) AS rn
+            FROM bank_kycdb_gold.hyperverge_udyam
+            WHERE COALESCE(__is_deleted, FALSE) = FALSE
+              AND date_of_udyam_registration IS NOT NULL
+        ) h ON h.uuid = u.user_id AND h.rn = 1
+        """
+    )
+
+    spark.sql(
+        """
+        CREATE OR REPLACE TEMP VIEW dca_udyam_reg_date_eq_onboarding_users AS
+        SELECT ob.user_id
+        FROM dca_onboarding_date_for_udyam_match ob
+        INNER JOIN dca_udyam_registration_date_hyperverge ur
+            ON ob.user_id = ur.user_id
+        WHERE ob.onboarding_date IS NOT NULL
+          AND ur.udyam_registration_date IS NOT NULL
+          AND date(ob.onboarding_date) = date(ur.udyam_registration_date)
+        """
+    )
+
+    # --- Reverse contact: >=1 saver (uuid_saved_by) who is MHA L1 (credit) or L1SR ---
+    spark.sql(
+        """
+        CREATE OR REPLACE TEMP VIEW mha_l1_uuid_credit_reverse_lookup AS
+        SELECT uuid AS user_id
+        FROM (
+            SELECT
+                uuid,
+                MIN(CASE WHEN layer = 0 THEN 1 ELSE layer END) AS eff_layer
+            FROM s3_tool_propagator_pii.mha_case_registry
+            WHERE txn_nature_mha = 'C'
+              AND uuid IS NOT NULL
+              AND LENGTH(TRIM(CAST(uuid AS STRING))) > 0
+            GROUP BY uuid
+        ) t
+        WHERE eff_layer = 1
+        """
+    )
+
+    spark.sql(
+        """
+        CREATE OR REPLACE TEMP VIEW l1sr_customer_uuids AS
+        SELECT DISTINCT c.id AS user_id
+        FROM uid_db_gold_pii.customers c
+        INNER JOIN l1sr_phone_lookup ls
+            ON SUBSTR(CAST(decryptFunction(c.mobile) AS STRING), -10) = ls.l1_sr_phone_num
+        WHERE c.mobile IS NOT NULL
+          AND LENGTH(TRIM(CAST(c.mobile AS STRING))) > 0
+        """
+    )
+
+    spark.sql(
+        """
+        CREATE OR REPLACE TEMP VIEW dca_reverse_contact_l1_l1sr_users AS
+        SELECT DISTINCT CAST(rc.uuid AS STRING) AS user_id
+        FROM data_sync_db_pii.slice_x_application_base_reverse_contacts rc
+        INNER JOIN dca_users d
+            ON CAST(d.user_id AS STRING) = CAST(rc.uuid AS STRING)
+        WHERE rc.uuid IS NOT NULL
+          AND rc.uuid_saved_by IS NOT NULL
+          AND CAST(rc.uuid AS STRING) <> CAST(rc.uuid_saved_by AS STRING)
+          AND (
+              CAST(rc.uuid_saved_by AS STRING) IN (
+                  SELECT CAST(user_id AS STRING) FROM mha_l1_uuid_credit_reverse_lookup
+              )
+              OR CAST(rc.uuid_saved_by AS STRING) IN (
+                  SELECT CAST(user_id AS STRING) FROM l1sr_customer_uuids
+              )
+          )
+        """
+    )
+
+
+def register_existing_categorical_geohash_for_reason(
+    spark: SparkSession, reason_key: str, view_name: str
+) -> None:
+    """Distinct decrypted geohash values already on type 938 with the given reason key."""
+    escaped = reason_key.replace("'", "''")
+    spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW {view_name} AS
+    SELECT DISTINCT decryptFunction(be.value) AS geohash
+    FROM slice_fcu_db_gold_pii.blacklist_entry be
+    INNER JOIN slice_fcu_db_gold.blacklist_type bt
+        ON be.blacklisttypeid = CAST(bt.id AS INT)
+    INNER JOIN slice_fcu_db_gold.blacklist_reason br
+        ON CAST(bt.id AS INT) = br.blacklisttypeid
+    INNER JOIN slice_fcu_db_gold.entry_reason_mapping brm
+        ON CAST(be.id AS INT) = brm.blacklistentryid
+        AND CAST(br.id AS INT) = brm.blacklistreasonid
+    WHERE be.blacklisttypeid = {CATEGORICAL_GEOHASH_BLACKLIST_TYPE_ID}
+      AND be.value IS NOT NULL
+      AND COALESCE(be.__is_deleted, false) = false
+      AND br.key = '{escaped}'
+    """)
+
+
+def discovery_columns_sql(prefix: str, categorical_exclude_view: Optional[str]) -> str:
+    """User-level discovery cohort; excludes BL 572 and 938/DCAONBOARDINGDECLINE on gh5/gh6; DCA CURRENT."""
+    cat_joins = ""
+    cat_pred = ""
+    if categorical_exclude_view:
+        cat_joins = f"""
+    LEFT JOIN {categorical_exclude_view} cex5 ON o.gh5 = cex5.geohash
+    LEFT JOIN {categorical_exclude_view} cex6 ON o.gh6 = cex6.geohash
+        """
+        cat_pred = "AND cex5.geohash IS NULL AND cex6.geohash IS NULL"
+
+    return f"""
+    SELECT
+        o.user_id,
+        o.product_type,
+        o.onboarding_date,
+        o.itc_flag,
+        o.current_device_id,
+        o.count_of_users_on_devices,
+        o.gh5,
+        o.gh6,
+        CASE WHEN fd.first_device_id IS NOT NULL AND o.current_device_id <> fd.first_device_id
+             THEN 1 ELSE 0 END AS device_change_flag,
+        COALESCE(m.l1_flag, 0) AS l1_flag,
+        COALESCE(ls.l1_sr_hit, 0) AS l1_sr_flag,
+        COALESCE(fz.freeze_flag, 0) AS freeze_flag
+    FROM onboarding_users_geohash o
+    LEFT JOIN signup_first_device_by_user fd ON o.user_id = fd.user_id
+    LEFT JOIN mha_credit_flags_by_user m ON o.user_id = m.user_id
+    LEFT JOIN uid_db_gold_pii.customers c ON o.user_id = c.id
+    LEFT JOIN l1sr_phone_lookup ls
+        ON SUBSTR(CAST(decryptFunction(c.mobile) AS STRING), -10) = ls.l1_sr_phone_num
+    LEFT JOIN freeze_flag_by_user fz ON o.user_id = fz.user_id
+    LEFT JOIN geo_hotspot_blacklist_{BL} g5 ON o.gh5 = g5.geohash
+    LEFT JOIN geo_hotspot_blacklist_{BL} g6 ON o.gh6 = g6.geohash
+    LEFT JOIN {VIEW_EXISTING_GLOBAL_ONB_DECLINE_GEOHASH} gl5 ON o.gh5 = gl5.geohash
+    LEFT JOIN {VIEW_EXISTING_GLOBAL_ONB_DECLINE_GEOHASH} gl6 ON o.gh6 = gl6.geohash
+    {cat_joins}
+    WHERE g5.geohash IS NULL AND g6.geohash IS NULL
+      AND gl5.geohash IS NULL AND gl6.geohash IS NULL
+      {cat_pred}
+      {prefix}
+    """
+
+
+def _l1_l1sr_hit_sum() -> F.Column:
+    return F.sum(
+        F.when((F.col("l1_flag") == 1) | (F.col("l1_sr_flag") == 1), F.lit(1)).otherwise(F.lit(0))
+    )
+
+
+def waterfall_bad_geohashes(df: DataFrame) -> tuple[DataFrame, DataFrame]:
+    """GH6 hotspots then GH5 on remainder; returns DataFrames (no driver collect)."""
+    base = df.filter(
+        F.col("gh6").isNotNull()
+        & (F.length(F.trim(F.col("gh6"))) > 0)
+        & F.col("gh5").isNotNull()
+        & (F.length(F.trim(F.col("gh5"))) > 0)
+    )
+    nu = F.countDistinct("user_id")
+    gh6_stats = (
+        base.groupBy("gh6")
+        .agg(nu.alias("n_users"), _l1_l1sr_hit_sum().alias("hits"))
+        .withColumn(
+            "precision_l1_l1sr",
+            F.when(F.col("n_users") > 0, F.col("hits") / F.col("n_users")).otherwise(F.lit(0.0)),
+        )
+    )
+    bad6 = gh6_stats.filter(
+        (F.col("n_users") >= F.lit(MIN_DISTINCT_USERS))
+        & (F.col("precision_l1_l1sr") >= F.lit(MIN_PRECISION))
+    ).select("gh6")
+    remaining = base.join(bad6, "gh6", "left_anti")
+    gh5_stats = (
+        remaining.groupBy("gh5")
+        .agg(nu.alias("n_users"), _l1_l1sr_hit_sum().alias("hits"))
+        .withColumn(
+            "precision_l1_l1sr",
+            F.when(F.col("n_users") > 0, F.col("hits") / F.col("n_users")).otherwise(F.lit(0.0)),
+        )
+    )
+    bad5 = gh5_stats.filter(
+        (F.col("n_users") >= F.lit(MIN_DISTINCT_USERS))
+        & (F.col("precision_l1_l1sr") >= F.lit(MIN_PRECISION))
+    ).select("gh5")
+    return bad6, bad5
+
+
+def register_pass_actions(
+    cohort_view: str, reason_key: str, existing_view: str, out_view: str
+) -> None:
+    """Run waterfall for one cohort and register deduped actions in a temp view."""
+    bad6, bad5 = waterfall_bad_geohashes(spark.table(cohort_view))
+    bad6.createOrReplaceTempView(f"{out_view}_bad6")
+    bad5.createOrReplaceTempView(f"{out_view}_bad5")
+    escaped_reason = reason_key.replace("'", "''")
+    spark.sql(
+        f"""
+        CREATE OR REPLACE TEMP VIEW {out_view} AS
+        SELECT DISTINCT blacklist_entry_value, blacklist_reason_key, geohash_precision
+        FROM (
+            SELECT
+                b.gh6 AS blacklist_entry_value,
+                '{escaped_reason}' AS blacklist_reason_key,
+                'gh6' AS geohash_precision
+            FROM {out_view}_bad6 b
+            LEFT ANTI JOIN {existing_view} e ON b.gh6 = e.geohash
+            WHERE b.gh6 IS NOT NULL AND LENGTH(TRIM(b.gh6)) > 0
+            UNION ALL
+            SELECT
+                b.gh5 AS blacklist_entry_value,
+                '{escaped_reason}' AS blacklist_reason_key,
+                'gh5' AS geohash_precision
+            FROM {out_view}_bad5 b
+            LEFT ANTI JOIN {existing_view} e ON b.gh5 = e.geohash
+            WHERE b.gh5 IS NOT NULL AND LENGTH(TRIM(b.gh5)) > 0
+        ) actions
+        """
+    )
+    logger.info("Registered %s for reason %s", out_view, reason_key)
+
+
+def geohash_summary(
+    spark: SparkSession,
+    df_view: str,
+    gh6_list: list[str],
+    gh5_list: list[str],
+):
+    df = spark.table(df_view)
+
+    hit = F.when(
+        (F.col("l1_flag") == 1) | (F.col("l1_sr_flag") == 1),
+        1,
+    ).otherwise(0)
+
+    summaries = []
+
+    # GH6 summaries
+    if gh6_list:
+        gh6_summary = (
+            df.filter(F.col("gh6").isin(gh6_list))
+            .groupBy("gh6")
+            .agg(
+                F.countDistinct("user_id").alias("total_users"),
+                F.sum(hit).alias("fraud_cases"),
+            )
+            .withColumn(
+                "precision",
+                F.round(F.col("fraud_cases") / F.col("total_users"), 4),
+            )
+            .withColumn("geohash_precision", F.lit("gh6"))
+            .withColumnRenamed("gh6", "geohash")
+        )
+
+        summaries.append(gh6_summary)
+
+    # GH5 summaries
+    if gh5_list:
+        remaining = df
+        if gh6_list:
+            remaining = remaining.filter(~F.col("gh6").isin(gh6_list))
+
+        gh5_summary = (
+            remaining.filter(F.col("gh5").isin(gh5_list))
+            .groupBy("gh5")
+            .agg(
+                F.countDistinct("user_id").alias("total_users"),
+                F.sum(hit).alias("fraud_cases"),
+            )
+            .withColumn(
+                "precision",
+                F.round(F.col("fraud_cases") / F.col("total_users"), 4),
+            )
+            .withColumn("geohash_precision", F.lit("gh5"))
+            .withColumnRenamed("gh5", "geohash")
+        )
+
+        summaries.append(gh5_summary)
+
+    if not summaries:
+        return None
+
+    final_df = summaries[0]
+    for s in summaries[1:]:
+        final_df = final_df.unionByName(s)
+
+    return final_df.orderBy(F.desc("fraud_cases"), F.desc("total_users"))
+
+
+def blacklist_geohashes(geohashes: Iterable[str], reason_key: str) -> tuple[int, int]:
+    """
+    POST each geohash to fraud-control blacklist create with CATEGORICALGEOHASH and the given reason.
+    One HTTP call per geohash (same reason for the batch).
+    """
+    url = "https://api.nebank.com/banking/fraud-control-go/v1/blacklist/v1/create"
+    headers = {"Content-Type": "application/json"}
+
+    success_count = 0
+    failure_count = 0
+    items = list(geohashes)
+    logger.info("Starting blacklisting for %s geohashes (reason=%s)...", len(items), reason_key)
+
+    for geohash in items:
+        entity = {
+            "blacklistTypeKey": "CATEGORICALGEOHASH",
+            "blacklistEntryValue": geohash,
+            "blacklistEntryReasonMapping": {reason_key: 1},
+        }
+        try:
+            logger.info("Blacklisting geohash: %s reason=%s", geohash, reason_key)
+            response = requests.post(url, headers=headers, json=entity, timeout=30)
+            if response.status_code == 200:
+                logger.info("Successfully blacklisted %s", geohash)
+                success_count += 1
+            else:
+                logger.error(
+                    "Failed to blacklist %s. Status=%s Response=%s",
+                    geohash,
+                    response.status_code,
+                    response.text,
+                )
+                failure_count += 1
+        except Exception as e:
+            logger.error("Exception while blacklisting %s: %s", geohash, e, exc_info=True)
+            failure_count += 1
+
+    logger.info("Blacklisting summary reason=%s: success=%s failure=%s", reason_key, success_count, failure_count)
+    return success_count, failure_count
+
+
+register_setup_views(spark)
+register_existing_categorical_geohash_for_reason(
+    spark, REASON_GLOBAL_ONBOARDING_DECLINE, VIEW_EXISTING_GLOBAL_ONB_DECLINE_GEOHASH
+)
+register_existing_categorical_geohash_for_reason(spark, REASON_PASS1, VIEW_EXISTING_R1)
+register_existing_categorical_geohash_for_reason(spark, REASON_PASS2, VIEW_EXISTING_R2)
+register_existing_categorical_geohash_for_reason(spark, REASON_PASS3, VIEW_EXISTING_R3)
+
+COHORT_SPECS = [
+    (
+        "cohort_pass1",
+        discovery_columns_sql("AND COALESCE(o.count_of_users_on_devices, 0) >= 2", VIEW_EXISTING_R1),
+        REASON_PASS1,
+        VIEW_EXISTING_R1,
+        "actions_pass1",
+    ),
+    (
+        "cohort_pass2",
+        discovery_columns_sql(
+            "AND o.user_id IN (SELECT user_id FROM dca_udyam_reg_date_eq_onboarding_users)",
+            VIEW_EXISTING_R2,
+        ),
+        REASON_PASS2,
+        VIEW_EXISTING_R2,
+        "actions_pass2",
+    ),
+    (
+        "cohort_pass3",
+        discovery_columns_sql(
+            "AND o.user_id IN (SELECT user_id FROM dca_reverse_contact_l1_l1sr_users)",
+            VIEW_EXISTING_R3,
+        ),
+        REASON_PASS3,
+        VIEW_EXISTING_R3,
+        "actions_pass3",
+    ),
+]
+
+for cohort_view, cohort_sql, reason_key, existing_view, actions_view in COHORT_SPECS:
+    spark.sql(f"CREATE OR REPLACE TEMP VIEW {cohort_view} AS {cohort_sql}")
+    try:
+        spark.catalog.cacheTable(cohort_view)
+    except Exception as e:
+        logger.warning("Could not cache %s (%s); continuing.", cohort_view, e)
+    logger.info("Running pass %s (%s)", reason_key, cohort_view)
+    register_pass_actions(cohort_view, reason_key, existing_view, actions_view)
+    try:
+        spark.catalog.uncacheTable(cohort_view)
+    except Exception:
+        pass
+
+spark.sql(
+    """
+    CREATE OR REPLACE TEMP VIEW to_action_dedup AS
+    SELECT DISTINCT blacklist_entry_value, blacklist_reason_key, geohash_precision
+    FROM (
+        SELECT * FROM actions_pass1
+        UNION ALL
+        SELECT * FROM actions_pass2
+        UNION ALL
+        SELECT * FROM actions_pass3
+    ) all_actions
+    """
+)
+
+to_action_dedup = spark.table("to_action_dedup").persist(StorageLevel.MEMORY_AND_DISK)
+
+out_base = OUTPUT_PATH.rstrip("/")
+logger.info("Writing action rows to %s/all_segments/", out_base)
+to_action_dedup.write.mode("append").parquet(f"{out_base}/all_segments/")
+
+for reason_key, subdir in (
+    (REASON_PASS1, "multiuserdevice"),
+    (REASON_PASS2, "udyamsamedayonboarding"),
+    (REASON_PASS3, "l1rcvkycreview"),
+):
+    reason_df = to_action_dedup.filter(F.col("blacklist_reason_key") == reason_key)
+    if not reason_df.head(1):
+        continue
+    reason_df.write.mode("append").parquet(f"{out_base}/{subdir}/")
+
+logger.info("Planned blacklist API calls (after existing filter per reason)")
+for row in to_action_dedup.orderBy("blacklist_reason_key", "blacklist_entry_value").limit(50).toLocalIterator():
+    logger.info("  %s  %s", row["blacklist_reason_key"], row["blacklist_entry_value"])
+
+total_ok = total_fail = 0
+api_action_count = 0
+for reason_key in (REASON_PASS1, REASON_PASS2, REASON_PASS3):
+    reason_geohashes = [
+        row["blacklist_entry_value"]
+        for row in to_action_dedup.filter(F.col("blacklist_reason_key") == reason_key)
+        .select("blacklist_entry_value")
+        .distinct()
+        .toLocalIterator()
+    ]
+    if not reason_geohashes:
+        continue
+    api_action_count += len(reason_geohashes)
+    ok, fail = blacklist_geohashes(reason_geohashes, reason_key)
+    total_ok += ok
+    total_fail += fail
+
+logger.info("All reasons done: api_calls=%s success=%s failure=%s", api_action_count, total_ok, total_fail)
+
+try:
+    to_action_dedup.unpersist()
+except Exception:
+    pass
