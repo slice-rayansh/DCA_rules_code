@@ -33,7 +33,16 @@ base_base AS (
         WHERE ca.rn = 1
     ) ks ON ks.customer_id = m.customer_id
     WHERE b.is_active = 1 AND b.__is_deleted = false AND b.product_code = 1150
-      AND m.mcc IN ('5999','5699','5968','5411','763','7322','7011','7929','7911')
+      AND m.mcc IN ('5968', '5999', '7322', '7929')
+      AND b.branch_code IN (333,19,48)
+      AND DATE(COALESCE(b.account_open_date, b.created_date))
+          BETWEEN DATE('2025-10-01') AND DATE('2026-04-30')
+    -- AND UPPER(TRIM(ks.kyc_state)) IN (
+    --       'BIHAR', 'DELHI', 'GUJARAT', 'JHARKHAND',
+    --       'MADHYA PRADESH', 'MP',
+    --       'MAHARASHTRA', 'PUNJAB', 'RAJASTHAN',
+    --       'TELANGANA', 'UTTARAKHAND', 'WEST BENGAL'
+    --   )
 ),
 base AS (
     SELECT * FROM base_base WHERE rn = 1
@@ -77,25 +86,19 @@ credits_10d AS (
             THEN 1 ELSE 0
         END AS is_cross_state,
         CASE WHEN CAST(t.amount AS DOUBLE) % 1000 = 0 THEN 1 ELSE 0 END AS is_round_1000,
-        CASE WHEN CAST(t.amount AS DOUBLE) % 100 = 0 THEN 1 ELSE 0 END  AS is_round_100,
-        -- Decimal flag: amount has paise (not a whole number)
-CASE WHEN CAST(t.amount AS DOUBLE) <> FLOOR(CAST(t.amount AS DOUBLE)) THEN 1 ELSE 0 END AS is_decimal,
-
--- Near-round: within 1-2% below a round threshold
--- Near 50k, 25k, 10k, 5k, 1k boundaries
-CASE WHEN CAST(t.amount AS DOUBLE) BETWEEN 49000 AND 49999 THEN 1
-     WHEN CAST(t.amount AS DOUBLE) BETWEEN 24000 AND 24999 THEN 1
-     WHEN CAST(t.amount AS DOUBLE) BETWEEN 9000 AND 9999   THEN 1
-     WHEN CAST(t.amount AS DOUBLE) BETWEEN 4500 AND 4999   THEN 1
-     WHEN CAST(t.amount AS DOUBLE) BETWEEN 900 AND 999     THEN 1
-     ELSE 0
-END AS is_near_round,
-
--- Specifically ends in 999 or 99 (classic evasion pattern)
-CASE WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 1000 = 999 THEN 1
-     WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 100 = 99   THEN 1
-     ELSE 0
-END AS is_ends_99_999
+        CASE WHEN CAST(t.amount AS DOUBLE) % 100 = 0 THEN 1 ELSE 0 END AS is_round_100,
+        CASE WHEN CAST(t.amount AS DOUBLE) <> FLOOR(CAST(t.amount AS DOUBLE)) THEN 1 ELSE 0 END AS is_decimal,
+        CASE WHEN CAST(t.amount AS DOUBLE) BETWEEN 49000 AND 49999 THEN 1
+             WHEN CAST(t.amount AS DOUBLE) BETWEEN 24000 AND 24999 THEN 1
+             WHEN CAST(t.amount AS DOUBLE) BETWEEN 9000 AND 9999   THEN 1
+             WHEN CAST(t.amount AS DOUBLE) BETWEEN 4500 AND 4999   THEN 1
+             WHEN CAST(t.amount AS DOUBLE) BETWEEN 900 AND 999     THEN 1
+             ELSE 0
+        END AS is_near_round,
+        CASE WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 1000 = 999 THEN 1
+             WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 100 = 99   THEN 1
+             ELSE 0
+        END AS is_ends_99_999
     FROM upiswitch_tpap_gold.cbs_transactions t
     JOIN user_labels ul ON t.user_account_number = ul.account_no
     AND CAST(t.created_at AS DATE) <= ul.onboarded_date + INTERVAL '10' DAY
@@ -106,6 +109,7 @@ END AS is_ends_99_999
       AND (t.__is_deleted IS NULL OR t.__is_deleted = false)
 
     UNION ALL
+
     -- IMPS credits
     SELECT
         ul.user_id,
@@ -122,25 +126,19 @@ END AS is_ends_99_999
             THEN 1 ELSE 0
         END AS is_cross_state,
         CASE WHEN CAST(t.amount AS DOUBLE) % 1000 = 0 THEN 1 ELSE 0 END AS is_round_1000,
-        CASE WHEN CAST(t.amount AS DOUBLE) % 100 = 0 THEN 1 ELSE 0 END  AS is_round_100,
-        -- Decimal flag: amount has paise (not a whole number)
-CASE WHEN CAST(t.amount AS DOUBLE) <> FLOOR(CAST(t.amount AS DOUBLE)) THEN 1 ELSE 0 END AS is_decimal,
-
--- Near-round: within 1-2% below a round threshold
--- Near 50k, 25k, 10k, 5k, 1k boundaries
-CASE WHEN CAST(t.amount AS DOUBLE) BETWEEN 49000 AND 49999 THEN 1
-     WHEN CAST(t.amount AS DOUBLE) BETWEEN 24000 AND 24999 THEN 1
-     WHEN CAST(t.amount AS DOUBLE) BETWEEN 9000 AND 9999   THEN 1
-     WHEN CAST(t.amount AS DOUBLE) BETWEEN 4500 AND 4999   THEN 1
-     WHEN CAST(t.amount AS DOUBLE) BETWEEN 900 AND 999     THEN 1
-     ELSE 0
-END AS is_near_round,
-
--- Specifically ends in 999 or 99 (classic evasion pattern)
-CASE WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 1000 = 999 THEN 1
-     WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 100 = 99   THEN 1
-     ELSE 0
-END AS is_ends_99_999
+        CASE WHEN CAST(t.amount AS DOUBLE) % 100 = 0 THEN 1 ELSE 0 END AS is_round_100,
+        CASE WHEN CAST(t.amount AS DOUBLE) <> FLOOR(CAST(t.amount AS DOUBLE)) THEN 1 ELSE 0 END AS is_decimal,
+        CASE WHEN CAST(t.amount AS DOUBLE) BETWEEN 49000 AND 49999 THEN 1
+             WHEN CAST(t.amount AS DOUBLE) BETWEEN 24000 AND 24999 THEN 1
+             WHEN CAST(t.amount AS DOUBLE) BETWEEN 9000 AND 9999   THEN 1
+             WHEN CAST(t.amount AS DOUBLE) BETWEEN 4500 AND 4999   THEN 1
+             WHEN CAST(t.amount AS DOUBLE) BETWEEN 900 AND 999     THEN 1
+             ELSE 0
+        END AS is_near_round,
+        CASE WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 1000 = 999 THEN 1
+             WHEN CAST(CAST(t.amount AS DOUBLE) AS BIGINT) % 100 = 99   THEN 1
+             ELSE 0
+        END AS is_ends_99_999
     FROM imps_switch_gold.imps_transactions t
     JOIN imps_switch_gold.imps_transaction_statuses ts
         ON t.id = ts.txn_id AND ts.txn_status = 'SUCCESS'
@@ -150,7 +148,6 @@ END AS is_ends_99_999
     WHERE t.year >= 2025
       AND t.txn_type = 'CREDIT'
       AND (t.__is_deleted IS NULL OR t.__is_deleted = false)
-
 ),
 per_user AS (
     SELECT
@@ -160,30 +157,25 @@ per_user AS (
         mcc,
         COUNT(*)                                                              AS total_credits,
         SUM(amount)                                                           AS total_credit_amt,
-        -- By rail
         SUM(CASE WHEN txn_rail = 'UPI' THEN 1 ELSE 0 END)                    AS upi_credit_count,
         SUM(CASE WHEN txn_rail = 'IMPS' THEN 1 ELSE 0 END)                   AS imps_credit_count,
-        -- Cross state
         SUM(is_cross_state)                                                   AS cross_state_count,
         SUM(CASE WHEN is_cross_state = 1 THEN amount ELSE 0 END)             AS cross_state_amt,
         SUM(CASE WHEN is_cross_state = 0 THEN 1 ELSE 0 END)                  AS same_state_count,
         SUM(CASE WHEN is_cross_state = 0 THEN amount ELSE 0 END)             AS same_state_amt,
         CAST(SUM(is_cross_state) * 1.0 / COUNT(*) AS DOUBLE)                 AS pct_cross_state,
         COUNT(DISTINCT CASE WHEN is_cross_state = 1 THEN counterparty_state END) AS distinct_cross_states,
-        -- Round figures
         SUM(is_round_1000)                                                    AS round_1000_count,
         SUM(CASE WHEN is_round_1000 = 1 THEN amount ELSE 0 END)              AS round_1000_amt,
         SUM(is_round_100)                                                     AS round_100_count,
         SUM(CASE WHEN is_round_100 = 1 THEN amount ELSE 0 END)               AS round_100_amt,
         CAST(SUM(is_round_1000) * 1.0 / COUNT(*) AS DOUBLE)                  AS pct_round_1000,
         CAST(SUM(is_round_100) * 1.0 / COUNT(*) AS DOUBLE)                   AS pct_round_100,
-        -- Cross state + round overlap
         SUM(CASE WHEN is_cross_state = 1 AND is_round_1000 = 1 THEN 1 ELSE 0 END) AS cross_state_round_1000_count,
         SUM(CASE WHEN is_cross_state = 1 AND is_round_100 = 1 THEN 1 ELSE 0 END)  AS cross_state_round_100_count,
-        -- Distinct amounts
+        SUM(is_decimal)                                                       AS decimal_credit_count,
         COUNT(DISTINCT amount)                                                AS distinct_amounts,
         CAST(COUNT(DISTINCT amount) * 1.0 / COUNT(*) AS DOUBLE)              AS distinct_amount_ratio,
-        -- Avg txn size
         AVG(amount)                                                           AS avg_credit_amt,
         AVG(CASE WHEN is_cross_state = 1 THEN amount END)                    AS avg_cross_state_amt,
         AVG(CASE WHEN is_cross_state = 0 THEN amount END)                    AS avg_same_state_amt
@@ -220,6 +212,7 @@ SELECT
     ROUND(pu.pct_round_100, 4)               AS pct_round_100,
     pu.cross_state_round_1000_count,
     pu.cross_state_round_100_count,
+    pu.decimal_credit_count,
     pu.distinct_amounts,
     ROUND(pu.distinct_amount_ratio, 4)       AS distinct_amount_ratio,
     ROUND(pu.avg_credit_amt, 2)              AS avg_credit_amt,
@@ -241,6 +234,15 @@ LEFT JOIN (
     SELECT user_id FROM druid_gold.user_savings_details
     WHERE txn_status <> 'NO_FREEZE' AND __is_deleted = FALSE
 ) bu ON bu.uuid = pu.user_id
-WHERE pu.total_credits > 10
-  AND pu.cross_state_count >= 8
+WHERE pu.total_credits >= 20
+  --AND pu.cross_state_count >= 5
+  AND ul.udyam_autofetched_flag = 0
+  AND bd.gst_ref_id IS NULL
+  AND bd.estimated_annual_turnover NOT IN ('BETWEEN_30_AND_40_LAKHS','BETWEEN_20_AND_30_LAKHS','BETWEEN_10_AND_20_LAKHS','BETWEEN_5_AND_10_LAKHS','LESS_THAN_1_LAKH','BETWEEN_1_AND_5_LAKHS','')
+  AND pu.distinct_cross_states >=10
+  AND pu.total_credit_amt >= 40000
+  AND pu.cross_state_round_100_count > 5
+  --AND pu.same_state_count < 50
+  --AND pu.decimal_credit_count = 0
+  AND sb.user_id IS NULL
 ORDER BY pu.user_segment, pu.cross_state_count DESC
